@@ -1,11 +1,10 @@
 FROM node:20-alpine
 WORKDIR /app
 
-# Minimal package.json
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
   "dependencies": { "node-fetch": "^3.3.2" }
@@ -36,29 +35,29 @@ export class SimklClient {
   async _get(path) {
     try {
       const r = await fetch(this.base + path, { headers: this.headers() });
-      const text = await r.text();
-      const body = text ? (() => { try { return JSON.parse(text); } catch { return { raw: text }; } })() : null;
-      if (!r.ok) return { ok: false, status: r.status, statusText: r.statusText, body, path };
-      return { ok: true, body, path };
+      const t = await r.text();
+      const body = t ? (()=>{ try { return JSON.parse(t); } catch { return { raw: t }; } })() : null;
+      if (!r.ok) return { ok:false, status:r.status, statusText:r.statusText, body, path };
+      return { ok:true, body, path };
     } catch (e) {
-      return { ok: false, status: 0, statusText: String(e?.message || e), body: null, path };
+      return { ok:false, status:0, statusText:String(e?.message||e), body:null, path };
     }
   }
 
-  // Seen sources
+  // seen sources
   historyMovies()   { return this._get('/sync/history/movies'); }
-  watchlistMovies() { return this._get('/sync/watchlist/movies'); }
   ratingsMovies()   { return this._get('/sync/ratings/movies'); }
+  watchlistMovies() { return this._get('/sync/watchlist/movies'); }
 
   historyShows()    { return this._get('/sync/history/shows'); }
-  watchlistShows()  { return this._get('/sync/watchlist/shows'); }
   ratingsShows()    { return this._get('/sync/ratings/shows'); }
+  watchlistShows()  { return this._get('/sync/watchlist/shows'); }
 
   historyAnime()    { return this._get('/sync/history/anime'); }
-  watchlistAnime()  { return this._get('/sync/watchlist/anime'); }
   ratingsAnime()    { return this._get('/sync/ratings/anime'); }
+  watchlistAnime()  { return this._get('/sync/watchlist/anime'); }
 
-  // Candidate pools with wide fallbacks + optional forced paths
+  // candidates with fallbacks (+ optional force)
   async candidatesMovies() {
     const forced = process.env.FORCE_MOVIE_PATH;
     const paths = forced ? [forced] : [
@@ -84,7 +83,7 @@ export class SimklClient {
       '/anime/recommendations','/recommendations/anime',
       '/anime/trending','/anime/trending/today',
       '/anime/popular','/anime/anticipated','/anime/top',
-      // many anime are typed as shows in Simkl
+      // many anime appear in general shows lists
       '/shows/trending','/shows/popular','/shows/top'
     ];
     return this._firstOk(paths);
@@ -93,10 +92,10 @@ export class SimklClient {
     const tried = [];
     for (const p of paths) {
       const r = await this._get(p);
-      tried.push({ path: p, ok: r.ok, status: r.status || 200 });
+      tried.push({ path:p, ok:r.ok, status:r.status||200 });
       if (r.ok && r.body) return { ...r, tried };
     }
-    return { ok: false, status: 404, statusText: 'No candidate endpoint OK', body: null, tried };
+    return { ok:false, status:404, statusText:'No candidate endpoint OK', body:null, tried };
   }
 }
 EOF
@@ -109,29 +108,28 @@ import { SimklClient } from './simklClient.js';
 
 const PORT = Number(process.env.PORT) || 7769;
 const TTL_MIN = Number(process.env.CACHE_TTL_MINUTES || 360);
-
-// For you: default to PLAIN numeric for TMDB/TVDB
 const EMIT_PLAIN = (process.env.EMIT_PLAIN_IDS ?? '1') === '1';
 
-// Hard default orders per your request:
-//   movies  -> tmdb (plain) first
-//   series  -> tvdb (plain) first
-//   anime   -> tvdb (plain) first
+// aiometadata-friendly defaults: plain TMDB for all unless you override via env
 const ORDER_GLOBAL = (process.env.PREFERRED_ID_ORDER || 'tmdb,tt,tvdb')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  .split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
 const ORDER_MOV = (process.env.PREFERRED_ID_ORDER_MOVIE  || 'tmdb,tt,tvdb').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-const ORDER_SER = (process.env.PREFERRED_ID_ORDER_SERIES || 'tvdb,tmdb,tt').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-const ORDER_ANI = (process.env.PREFERRED_ID_ORDER_ANIME  || 'tvdb,tmdb,tt').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+const ORDER_SER = (process.env.PREFERRED_ID_ORDER_SERIES || 'tmdb,tt,tvdb').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+const ORDER_ANI = (process.env.PREFERRED_ID_ORDER_ANIME  || 'tmdb,tt,tvdb').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
 const ORDER = { movie: ORDER_MOV, series: ORDER_SER, anime: ORDER_ANI };
+
+// choose which Simkl lists count as "seen"
+const SEEN_SOURCES = (process.env.SEEN_SOURCES || 'history,ratings')
+  .split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
 
 const manifest = {
   id: 'org.simkl.picks',
-  version: '2.0.3',
+  version: '2.0.4',
   name: 'SimklPicks (AI)',
-  description: 'AI re-ranked unseen recommendations from your Simkl profile (IDs only; metadata via your other addon)',
+  description: 'AI re-ranked unseen recs from your Simkl profile (IDs only; metadata via your other addon)',
   resources: ['catalog'],
   types: ['movie','series'],
-  idPrefixes: ['tt','tmdb','tvdb'],  // we still advertise prefixes for compatibility
+  idPrefixes: ['tt','tmdb','tvdb'],
   catalogs: [
     { type: 'series', id: 'simklpicks.recommended-series', name: 'Simkl Picks • Series (AI, unseen)' },
     { type: 'movie',  id: 'simklpicks.recommended-movies', name: 'Simkl Picks • Movies (AI, unseen)' },
@@ -144,24 +142,19 @@ const simkl = new SimklClient({
   accessToken: process.env.SIMKL_ACCESS_TOKEN
 });
 
-// Cache
 const cache = new Map();
 const k = (kind) => `cat:${kind}`;
 const now = () => Date.now();
 const expired = (t) => now() > t;
 
-// --- ID helpers (tmdb plain for movies; tvdb plain for series/anime) ---
+// ----- ID helpers -----
 function chooseIdByOrder(idsObj = {}, order) {
   for (const key of order) {
     if ((key === 'tt' || key === 'imdb') && idsObj.imdb) {
       return String(idsObj.imdb).startsWith('tt') ? idsObj.imdb : `tt${idsObj.imdb}`;
     }
-    if (key === 'tmdb' && idsObj.tmdb != null) {
-      return EMIT_PLAIN ? String(idsObj.tmdb) : `tmdb:${idsObj.tmdb}`;
-    }
-    if (key === 'tvdb' && idsObj.tvdb != null) {
-      return EMIT_PLAIN ? String(idsObj.tvdb) : `tvdb:${idsObj.tvdb}`;
-    }
+    if (key === 'tmdb' && idsObj.tmdb != null) return EMIT_PLAIN ? String(idsObj.tmdb) : `tmdb:${idsObj.tmdb}`;
+    if (key === 'tvdb' && idsObj.tvdb != null) return EMIT_PLAIN ? String(idsObj.tvdb) : `tvdb:${idsObj.tvdb}`;
   }
   return null;
 }
@@ -175,7 +168,7 @@ const pickId = (b = {}, kind) => {
   return b.slug || String(Math.random()).slice(2);
 };
 
-// Normalize Simkl lists
+// normalize
 function norm(b) {
   if (Array.isArray(b)) return b;
   if (b && Array.isArray(b.movies)) return b.movies;
@@ -186,12 +179,24 @@ function norm(b) {
   return [];
 }
 
-// Build seen set
+// seen set per SEEN_SOURCES
 async function buildSeen(kind) {
-  const calls =
-    kind === 'movie'  ? [simkl.historyMovies(), simkl.ratingsMovies(), simkl.watchlistMovies()] :
-    kind === 'series' ? [simkl.historyShows(),  simkl.ratingsShows(),  simkl.watchlistShows()]  :
-                        [simkl.historyAnime(),  simkl.ratingsAnime(),  simkl.watchlistAnime()];
+  const wants = new Set(SEEN_SOURCES);
+  const calls = [];
+  if (kind === 'movie') {
+    if (wants.has('history'))  calls.push(simkl.historyMovies());
+    if (wants.has('ratings'))  calls.push(simkl.ratingsMovies());
+    if (wants.has('watchlist'))calls.push(simkl.watchlistMovies());
+  } else if (kind === 'series') {
+    if (wants.has('history'))  calls.push(simkl.historyShows());
+    if (wants.has('ratings'))  calls.push(simkl.ratingsShows());
+    if (wants.has('watchlist'))calls.push(simkl.watchlistShows());
+  } else {
+    if (wants.has('history'))  calls.push(simkl.historyAnime());
+    if (wants.has('ratings'))  calls.push(simkl.ratingsAnime());
+    if (wants.has('watchlist'))calls.push(simkl.watchlistAnime());
+  }
+
   const res = await Promise.all(calls);
   const S = new Set();
   for (const r of res) if (r.ok) {
@@ -204,17 +209,15 @@ async function buildSeen(kind) {
   return S;
 }
 
-// Candidates
+// candidates
 async function candidates(kind) {
-  const r = kind === 'movie' ? await simkl.candidatesMovies()
-          : kind === 'series' ? await simkl.candidatesShows()
-          : await simkl.candidatesAnime();
-  return r;
+  return kind === 'movie' ? simkl.candidatesMovies()
+       : kind === 'series' ? simkl.candidatesShows()
+       : simkl.candidatesAnime();
 }
 
-// LLM rank (uses OpenRouter/OpenAI if API key is set)
+// LLM rank (OpenRouter / OpenAI if configured)
 async function llmRank(kind, profile, candList) {
-  const model = process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet';
   const want = Math.min(50, candList.length);
   const sys = `You are a movie/TV recommender. Return ONLY a JSON array of up to ${want} objects with keys {id}. No prose.`;
   const user = {
@@ -228,7 +231,6 @@ async function llmRank(kind, profile, candList) {
       rating: c.user_rating || c.rating || ''
     }))
   };
-
   const hasOR = !!process.env.OPENROUTER_API_KEY;
   const hasOA = !!process.env.OPENAI_API_KEY;
 
@@ -237,24 +239,27 @@ async function llmRank(kind, profile, candList) {
       const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages: [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }], temperature: 0.2, response_format: { type: "json_object" } })
+        body: JSON.stringify({ model: process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet',
+          messages: [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }],
+          temperature: 0.2, response_format: { type: "json_object" } })
       });
       const j = await r.json().catch(()=>null);
       const content = j?.choices?.[0]?.message?.content || '[]';
       return safeParseIdList(content);
     }
     if (hasOA) {
-      const mdl = process.env.LLM_MODEL || 'gpt-4o-mini';
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: mdl, messages: [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }], temperature: 0.2, response_format: { type: "json_object" } })
+        body: JSON.stringify({ model: process.env.LLM_MODEL || 'gpt-4o-mini',
+          messages: [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }],
+          temperature: 0.2, response_format: { type: "json_object" } })
       });
       const j = await r.json().catch(()=>null);
       const content = j?.choices?.[0]?.message?.content || '[]';
       return safeParseIdList(content);
     }
-  } catch (_) { /* fall through */ }
+  } catch (_) {}
 
   return candList.slice(0, want).map(c => c.__id);
 }
@@ -266,17 +271,17 @@ function safeParseIdList(s) {
   } catch { return []; }
 }
 
-// Build catalog
+// build catalog
 async function buildCatalog(kind) {
   const seen = await buildSeen(kind);
   const candResp = await candidates(kind);
-  if (!candResp.ok) return { metas: [], usedPath: null, tried: candResp.tried || [], error: { status: candResp.status, statusText: candResp.statusText } };
+  if (!candResp.ok) return { metas: [], tried: candResp.tried || [], error: { status: candResp.status, statusText: candResp.statusText } };
 
   let pool = norm(candResp.body).map(x => x.movie || x.show || x.anime || x || {});
   pool = pool.map(b => ({ ...b, __id: pickId(b, kind) })).filter(b => b.__id);
-  pool = pool.filter(b => !seen.has(b.__id));
+  pool = pool.filter(b => !seen.has(b.__id)); // unseen
 
-  // lightweight profile for LLM
+  // simple profile for LLM
   const genres = {};
   for (const b of pool.slice(0,80)) {
     for (const gg of Array.isArray(b.genres||b.genre)? (b.genres||b.genre) : String(b.genres||b.genre||'').split(',')) {
@@ -285,21 +290,16 @@ async function buildCatalog(kind) {
   }
   const profile = { top_genres: Object.entries(genres).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([g,c])=>`${g}(${c})`) };
 
-  const rankedIds = await llmRank(kind, profile, pool.slice(0, 120));
+  const rankedIds = await llmRank(kind, profile, pool.slice(0,120));
   const rankedSet = new Set(rankedIds);
-  const ordered = (rankedIds.length ? pool.filter(b => rankedSet.has(b.__id)) : pool).slice(0, 50);
+  const ordered = (rankedIds.length ? pool.filter(b => rankedSet.has(b.__id)) : pool).slice(0,50);
 
-  const metas = ordered.map(b => ({
-    id: b.__id,          // movies: TMDB plain; series/anime: TVDB plain
-    type: kind,
-    name: b.title || b.name || 'Untitled',
-    year: b.year || b.first_aired || undefined
-  }));
-  return { metas, usedPath: candResp.path, tried: candResp.tried || [], error: null };
+  const metas = ordered.map(b => ({ id:b.__id, type:kind, name:b.title||b.name||'Untitled', year:b.year||b.first_aired||undefined }));
+  return { metas };
 }
 
-// HTTP helpers + routes
-function sendJson(res, obj, code = 200) {
+// HTTP
+function sendJson(res, obj, code=200) {
   const s = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
   res.end(s);
@@ -311,60 +311,47 @@ http.createServer(async (req, res) => {
     const parts = url.pathname.split('/').filter(Boolean);
 
     if (url.pathname === '/' || url.pathname === '/health') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('ok'); }
-    if (url.pathname === '/manifest.json') return sendJson(res, manifest);
-    if (url.pathname === '/refresh') { cache.clear(); return sendJson(res, { ok: true, cleared: true }); }
+    if (url.pathname === '/manifest.json') return sendJson(res, {
+      ...${JSON.stringify({})}, // no-op to keep heredoc simple
+      ...${'{}'},
+      ... ( ()=> ({ ...manifest }) )()
+    });
+    if (url.pathname === '/refresh') { cache.clear(); return sendJson(res, { ok:true, cleared:true }); }
 
-    // Which endpoint worked?
-    if (url.pathname === '/probe') {
-      const kind = (url.searchParams.get('kind') || 'movie').toLowerCase();
-      const r = await candidates(kind);
-      if (!r.ok) return sendJson(res, { ok: false, tried: r.tried || [], status: r.status, statusText: r.statusText }, 200);
-      const list = (Array.isArray(r.body) ? r.body : (r.body?.items || r.body?.data || r.body?.shows || r.body?.movies || r.body?.anime || []));
-      return sendJson(res, { ok: true, usedPath: r.path, tried: r.tried || [], count: list.length }, 200);
-    }
-
-    // ID preview (confirms plain TMDB/TVDB)
+    // ids preview
     if (url.pathname === '/ids-preview') {
       const kind = (url.searchParams.get('type') || 'movie').toLowerCase();
       const r = await candidates(kind);
-      if (!r.ok) return sendJson(res, { error: { status: r.status, statusText: r.statusText }, tried: r.tried || [] }, 200);
-      const list = (Array.isArray(r.body) ? r.body : (r.body?.items || r.body?.data || r.body?.shows || r.body?.movies || r.body?.anime || []))
-        .map(x => x.movie || x.show || x.anime || x || {}).slice(0, 20);
-      return sendJson(res, {
-        emitPlain: EMIT_PLAIN,
-        order: ORDER[kind],
-        type: kind,
-        items: list.map(b => ({ chosen: pickId(b, kind), ids: b.ids || {}, title: b.title || b.name }))
-      }, 200);
+      if (!r.ok) return sendJson(res, { error:{ status:r.status, statusText:r.statusText } }, 200);
+      const list = norm(r.body).map(x => x.movie||x.show||x.anime||x||{}).slice(0,20);
+      return sendJson(res, { type:kind, order:ORDER[kind], emitPlain:EMIT_PLAIN, items:list.map(b => ({ chosen: pickId(b, kind), ids:b.ids||{}, title:b.title||b.name })) });
     }
 
-    // Catalogs
-    const isNew = parts[0] === 'stremio' && parts[1] === 'v1' && parts[2] === 'catalog';
-    const isOld = parts[0] === 'catalog';
+    // catalogs (new + legacy)
+    const isNew = parts[0]==='stremio' && parts[1]==='v1' && parts[2]==='catalog';
+    const isOld = parts[0]==='catalog';
     if (isNew || isOld) {
       const type = isNew ? parts[3] : parts[1];
       const id   = (isNew ? parts[4] : parts[2] || '').replace(/\.json$/i, '');
+      let kind=null;
+      if (id==='simklpicks.recommended-movies' && type==='movie')  kind='movie';
+      if (id==='simklpicks.recommended-series' && type==='series') kind='series';
+      if (id==='simklpicks.recommended-anime'  && type==='series') kind='anime';
+      if (!kind) return sendJson(res, { metas:[] }, 200);
 
-      let kind = null;
-      if (id === 'simklpicks.recommended-movies'  && type === 'movie')  kind = 'movie';
-      if (id === 'simklpicks.recommended-series'  && type === 'series') kind = 'series';
-      if (id === 'simklpicks.recommended-anime'   && type === 'series') kind = 'anime';
-
-      if (!kind) return sendJson(res, { metas: [] }, 200);
-
-      const C = cache.get(k(kind));
-      if (C && !expired(C.exp)) return sendJson(res, { metas: C.data }, 200);
+      const C = cache.get(kind);
+      if (C && !expired(C.exp)) return sendJson(res, { metas:C.data }, 200);
 
       const { metas, error } = await buildCatalog(kind);
-      if (error) return sendJson(res, { metas: [], error: { source: 'simkl', ...error } }, 200);
+      if (error) return sendJson(res, { metas:[], error:{ source:'simkl', ...error } }, 200);
 
-      cache.set(k(kind), { data: metas, exp: Date.now() + TTL_MIN*60*1000 });
+      cache.set(kind, { data: metas, exp: Date.now() + TTL_MIN*60*1000 });
       return sendJson(res, { metas }, 200);
     }
 
     res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
   } catch (e) {
-    sendJson(res, { error: { source: 'server', message: String(e?.message || e) } }, 200);
+    sendJson(res, { error:{ source:'server', message:String(e?.message||e) } }, 200);
   }
 }).listen(PORT, () => {
   console.log(`[SimklPicks] listening on :${PORT}`);
