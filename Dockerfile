@@ -1,4 +1,4 @@
-# ===== SimklPicks (IDs-only) : dual routes + normalizer + debug =====
+# ===== SimklPicks (IDs-only) with configurable ID priority + ids-preview =====
 FROM node:20-alpine
 WORKDIR /app
 
@@ -6,7 +6,7 @@ WORKDIR /app
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "1.5.5",
+  "version": "1.6.0",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
   "dependencies": { "node-fetch": "^3.3.2" }
@@ -16,7 +16,7 @@ EOF
 RUN npm install --omit=dev
 RUN mkdir -p src
 
-# --- Simkl client (safe errors, Bearer auth header built from SIMKL_ACCESS_TOKEN) ---
+# --- Simkl client (safe errors, Bearer auth) ---
 RUN cat > src/simklClient.js <<'EOF'
 import fetch from 'node-fetch';
 
@@ -60,18 +60,22 @@ export class SimklClient {
 }
 EOF
 
-# --- Server (IDs-only metas; lets your metadata addon resolve posters/titles) ---
+# --- Server (IDs-only metas; metadata resolved by your other addon) ---
 RUN cat > src/index.js <<'EOF'
 import http from 'http';
 import { SimklClient } from './simklClient.js';
 
 const PORT = Number(process.env.PORT) || 7769;
 
+// Allow choosing which ID we emit (comma-separated, case-insensitive)
+const ORDER = (process.env.PREFERRED_ID_ORDER || 'tmdb,tt,tvdb')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
 const manifest = {
   id: 'org.simkl.picks',
-  version: '1.5.5',
+  version: '1.6.0',
   name: 'SimklPicks',
-  description: 'Recommendations based on your Simkl watchlists/history (IDs only; metadata resolved by your other addon)',
+  description: 'Recommendations based on your Simkl watchlists/history (IDs only; metadata provided by your other addon)',
   resources: ['catalog'],
   types: ['movie','series'],
   idPrefixes: ['tt','tmdb','tvdb'],
@@ -88,16 +92,31 @@ const simkl = new SimklClient({
 });
 
 // ---- helpers ----
-// Prefer IMDb (tt…), else TMDB/TVDB, else slug
+function chooseIdByOrder(idsObj = {}) {
+  for (const key of ORDER) {
+    if (key === 'tt' || key === 'imdb') {
+      if (idsObj.imdb) return String(idsObj.imdb).startsWith('tt') ? idsObj.imdb : `tt${idsObj.imdb}`;
+    } else if (key === 'tmdb' && idsObj.tmdb) {
+      return `tmdb:${idsObj.tmdb}`;
+    } else if (key === 'tvdb' && idsObj.tvdb) {
+      return `tvdb:${idsObj.tvdb}`;
+    }
+  }
+  return null;
+}
+
+// Prefer configured order; fall back to any available; else slug/random
 const pickId = (b = {}) => {
   const ids = b.ids || {};
+  const chosen = chooseIdByOrder(ids);
+  if (chosen) return chosen;
   if (ids.imdb) return String(ids.imdb).startsWith('tt') ? ids.imdb : `tt${ids.imdb}`;
   if (ids.tmdb) return `tmdb:${ids.tmdb}`;
   if (ids.tvdb) return `tvdb:${ids.tvdb}`;
   return b.slug || String(Math.random()).slice(2);
 };
 
-// Minimal metas (id + type; optional name kept for UX but your metadata addon will override)
+// Minimal metas (id + type; optional name for UX)
 const toMeta = (x, forcedType) => {
   const b = x.movie || x.show || x.anime || x || {};
   return {
@@ -117,7 +136,7 @@ function sendJson(res, obj, code = 200) {
   res.end(s);
 }
 
-// Normalize Simkl response shapes (some endpoints return {movies:[...]}, etc.)
+// Normalize Simkl response shapes
 function normalizeListBody(b) {
   if (Array.isArray(b)) return b;
   if (b && Array.isArray(b.movies)) return b.movies;
@@ -145,7 +164,7 @@ http.createServer(async (req, res) => {
     }
     if (url.pathname === '/manifest.json') return sendJson(res, manifest);
 
-    // Debug endpoints
+    // Debug: auth
     if (url.pathname === '/debug-auth') {
       const test = await simkl.watchlistMovies();
       return sendJson(res, {
@@ -158,6 +177,7 @@ http.createServer(async (req, res) => {
       });
     }
 
+    // Debug: counts
     if (url.pathname === '/debug') {
       const fns = [
         'historyMovies','watchlistMovies','ratingsMovies',
@@ -173,8 +193,24 @@ http.createServer(async (req, res) => {
       return sendJson(res, out);
     }
 
+    // Debug: preview emitted IDs (first 20) for quick troubleshooting
+    if (url.pathname === '/ids-preview') {
+      const type = (url.searchParams.get('type') || 'movie').toLowerCase();
+      let r;
+      if (type === 'movie')       r = await simkl.watchlistMovies();
+      else if (type === 'series') r = await simkl.watchlistShows();
+      else if (type === 'anime')  r = await simkl.watchlistAnime();
+      else return sendJson(res, { error: 'type must be movie|series|anime' }, 400);
+
+      if (!r.ok) return sendJson(res, { error: r }, 200);
+      const list = normalizeListBody(r.body).slice(0, 20).map(x => {
+        const b = x.movie || x.show || x.anime || x || {};
+        return { chosen: pickId(b), ids: b.ids || {}, title: b.title || b.name };
+      });
+      return sendJson(res, { order: ORDER, type, items: list }, 200);
+    }
+
     // ---- Catalog routes (support both new and legacy paths) ----
-    // /stremio/v1/catalog/<type>/<id>.json  OR  /catalog/<type>/<id>.json
     const isNew = parts[0] === 'stremio' && parts[1] === 'v1' && parts[2] === 'catalog';
     const isOld = parts[0] === 'catalog';
     if (isNew || isOld) {
