@@ -2,11 +2,11 @@
 FROM node:20-alpine
 WORKDIR /app
 
-# Create package.json with minimal deps
+# bump version to bust cache
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Personalized Stremio recommendations based on Simkl history and watchlists",
   "type": "module",
   "main": "src/index.js",
@@ -30,7 +30,7 @@ import { buildCatalog } from './buildCatalog.js';
 
 const manifest = {
   id: 'org.abraham.simklpicks',
-  version: '1.3.0',
+  version: '1.3.1',
   name: 'SimklPicks',
   description: 'Recommendations from your Simkl watchlists & history',
   resources: ['catalog'],
@@ -64,35 +64,43 @@ function notFound(res) {
 }
 
 const port = Number(process.env.PORT) || 7769;
-console.log(`[SimklPicks] EXCLUDE_HISTORY=${process.env.EXCLUDE_HISTORY ?? 'true'} EXCLUDE_RATED=${process.env.EXCLUDE_RATED ?? 'true'}`);
 
 http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const parts = url.pathname.split('/').filter(Boolean);
 
+    // health
     if (['/', '/health', '/_health'].includes(url.pathname)) {
       res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
       return res.end('ok');
     }
+
+    // manifest
     if (url.pathname === '/manifest.json') return sendJson(res, manifest);
 
-    // Debug endpoint
+    // ---- new: /debug-auth ----
+    if (url.pathname === '/debug-auth') {
+      const diag = await client.debugAuth();
+      return sendJson(res, diag);
+    }
+
+    // existing /debug (counts)
     if (url.pathname === '/debug') {
       const out = {};
       for (const fn of ['historyMovies','watchlistMovies','ratingsMovies','historyShows','watchlistShows','ratingsShows','historyAnime','watchlistAnime','ratingsAnime']) {
-        try { const data = await client[fn](); out[fn] = data.length; } 
-        catch (e) { out[fn] = 'ERR ' + e.message; }
+        try { const data = await client[fn](); out[fn] = Array.isArray(data) ? data.length : data?.length ?? 0; } 
+        catch (e) { out[fn] = 'ERR ' + (e.message || String(e)); }
       }
       return sendJson(res, out);
     }
 
-    // Catalogs
+    // catalogs
     if (parts[0] === 'catalog') {
       const type = parts[1];
       const id = (parts[2] || '').replace(/\.json$/i, '');
       if (!type || !id) return notFound(res);
-      const metas = await buildCatalog({ client, type, listId: id });
+      const metas = await buildCatalog({ client, type, listId: id, noFilter: url.searchParams.get('debug') === '1' });
       return sendJson(res, { metas });
     }
 
@@ -110,6 +118,7 @@ EOF
 # ---- src/simklClient.js ----
 RUN cat > /app/src/simklClient.js <<'EOF'
 import fetch from 'node-fetch';
+
 export class SimklClient {
   constructor({ apiKey, accessToken, cacheMinutes = 30 }) {
     this.apiKey = apiKey;
@@ -122,7 +131,8 @@ export class SimklClient {
     return {
       'Content-Type': 'application/json',
       'simkl-api-key': this.apiKey,
-      ...(this.accessToken ? { 'Authorization': `Bearer ${this.accessToken}` } : {})
+      // IMPORTANT: Simkl expects the RAW token (no "Bearer ")
+      ...(this.accessToken ? { 'Authorization': this.accessToken } : {})
     };
   }
   async _get(path) {
@@ -130,12 +140,40 @@ export class SimklClient {
     const cached = this.cache.get(url);
     const now = Date.now();
     if (cached && (now - cached.ts) < this.cacheMs) return cached.data;
+
     const res = await fetch(url, { headers: this.headers() });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    const data = await res.json();
+    const bodyText = await res.text().catch(()=>'');
+    if (!res.ok) {
+      console.error(`[SIMKL] ${res.status} ${res.statusText} on ${path} :: ${bodyText.slice(0,200)}`);
+      throw new Error(`SIMKL ${res.status} ${res.statusText}`);
+    }
+    const data = bodyText ? JSON.parse(bodyText) : [];
     this.cache.set(url, { ts: now, data });
     return data;
   }
+
+  // debug-auth: make a single call and return status details
+  async debugAuth() {
+    try {
+      // call a cheap endpoint
+      await this._get('/sync/watchlist/movies');
+      return {
+        ok: true,
+        hasApiKey: Boolean(this.apiKey),
+        authHeaderHasBearer: String(this.accessToken || '').startsWith('Bearer '),
+        note: 'Auth looks good; try /debug for counts.'
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        error: e.message,
+        hasApiKey: Boolean(this.apiKey),
+        authHeaderHasBearer: String(this.accessToken || '').startsWith('Bearer '),
+        hint: 'If authHeaderHasBearer=true, remove "Bearer " from SIMKL_ACCESS_TOKEN.'
+      };
+    }
+  }
+
   historyMovies()   { return this._get('/sync/history/movies'); }
   historyShows()    { return this._get('/sync/history/shows'); }
   watchlistMovies() { return this._get('/sync/watchlist/movies'); }
@@ -190,36 +228,48 @@ function toMetaPreview(simklItem, prefer) {
   const id = imdb || (ids.tmdb ? `tmdb:${ids.tmdb}` : (ids.tvdb ? `tvdb:${ids.tvdb}` : (base.slug || base.title)));
   return { id, name: base.title || base.name || 'Unknown', poster: base.poster || base.image, posterShape:'poster', year: base.year, genres: base.genres || [], ratings: base.ratings || {} };
 }
-function uniqueById(arr){const s=new Set();const o=[];for(const i of arr){if(i?.id&&!s.has(i.id)){s.add(i.id);o.push(i);}}return o;}
-function idSet(list){const s=new Set();for(const x of list)if(x?.id)s.add(x.id);return s;}
+const uniqueById = arr => { const s=new Set(), o=[]; for (const i of arr) if (i?.id && !s.has(i.id)) { s.add(i.id); o.push(i); } return o; };
+const idSet = list => { const s=new Set(); for (const x of list) if (x?.id) s.add(x.id); return s; };
 
-export async function buildCatalog({ client, type, listId }) {
+export async function buildCatalog({ client, type, listId, noFilter = false }) {
   const isAnime = listId === 'simklpicks.recommended-anime';
   const preferKey = isAnime ? 'anime' : (type === 'movie' ? 'movie' : 'show');
 
   let historyRaw=[], watchlistRaw=[], ratingsRaw=[];
-  try { historyRaw   = isAnime ? await client.historyAnime()   : type==='movie'?await client.historyMovies()   : await client.historyShows(); } catch {}
-  try { watchlistRaw = isAnime ? await client.watchlistAnime() : type==='movie'?await client.watchlistMovies() : await client.watchlistShows(); } catch {}
-  try { ratingsRaw   = isAnime ? await client.ratingsAnime()   : type==='movie'?await client.ratingsMovies()   : await client.ratingsShows(); } catch {}
+  try { historyRaw   = isAnime ? await client.historyAnime()   : type==='movie'?await client.historyMovies()   : await client.historyShows(); } catch (e) { console.error('history err', e.message); }
+  try { watchlistRaw = isAnime ? await client.watchlistAnime() : type==='movie'?await client.watchlistMovies() : await client.watchlistShows(); } catch (e) { console.error('watchlist err', e.message); }
+  try { ratingsRaw   = isAnime ? await client.ratingsAnime()   : type==='movie'?await client.ratingsMovies()   : await client.ratingsShows(); } catch (e) { console.error('ratings err', e.message); }
 
   const historyItems   = (historyRaw||[]).map(x=>toMetaPreview(x,preferKey));
   const watchlistItems = (watchlistRaw||[]).map(x=>toMetaPreview(x,preferKey));
   const ratingsItems   = (ratingsRaw||[]).map(x=>toMetaPreview(x,preferKey));
 
-  const seen = EXCLUDE_HISTORY ? idSet(historyItems) : new Set();
-  const rated= EXCLUDE_RATED   ? idSet(ratingsItems) : new Set();
+  let pool = uniqueById([...watchlistItems, ...ratingsItems]);
 
-  let pool = uniqueById([...watchlistItems,...ratingsItems]).filter(i=>!seen.has(i.id)&&!rated.has(i.id));
-  if(pool.length<25){const lenient=uniqueById([...watchlistItems,...ratingsItems,...historyItems]).filter(i=>!seen.has(i.id)&&!rated.has(i.id));if(lenient.length>pool.length)pool=lenient;}
-  if(!pool.length)return [];
+  if (!noFilter) {
+    const seen  = EXCLUDE_HISTORY ? idSet(historyItems) : new Set();
+    const rated = EXCLUDE_RATED   ? idSet(ratingsItems) : new Set();
+    pool = pool.filter(i => !seen.has(i.id) && !rated.has(i.id));
+    if (pool.length < 25) {
+      const lenient = uniqueById([...watchlistItems, ...ratingsItems, ...historyItems])
+        .filter(i => !seen.has(i.id) && !rated.has(i.id));
+      if (lenient.length > pool.length) pool = lenient;
+    }
+  } else {
+    if (pool.length < 25) pool = uniqueById([...pool, ...historyItems]);
+  }
 
-  const profile=buildUserProfile({history:historyRaw});
-  const scored=pool.map(i=>({...i,score:scoreItem({item:i,inWatchlist:watchlistItems.find(w=>w.id===i.id),profile})}));
-  return normalizeTopN(scored,50);
+  if (!pool.length) return [];
+
+  const profile = buildUserProfile({ history: historyRaw });
+  const scored = pool.map(i => ({
+    ...i,
+    score: scoreItem({ item: i, inWatchlist: watchlistItems.find(w => w.id === i.id), profile })
+  }));
+  return normalizeTopN(scored, 50);
 }
 EOF
 
-# Runtime env
 ENV PORT=7769
 EXPOSE 7769
 CMD ["npm","start"]
