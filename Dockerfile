@@ -1,14 +1,16 @@
 FROM node:20-alpine
 WORKDIR /app
 
-# Minimal package
+# Minimal package descriptor
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
-  "dependencies": { "node-fetch": "^3.3.2" }
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
 }
 EOF
 
@@ -32,6 +34,7 @@ function H() {
     'simkl-api-key': process.env.SIMKL_API_KEY || ''
   };
   const tok = process.env.SIMKL_ACCESS_TOKEN || '';
+  // Some SIMKL tokens require "Bearer " prefix; controlled by SIMKL_BEARER=1
   if (tok) h['Authorization'] = (process.env.SIMKL_BEARER === '1') ? `Bearer ${tok}` : tok;
   return h;
 }
@@ -54,7 +57,7 @@ export async function buckets(kind){ // 'movie' | 'series'
 }
 
 export function profileFrom({history=[],ratings=[]}){
-  // Build a light profile (genres + weights) for AI prompt
+  // Lightweight taste profile (genre weights)
   const bag = new Map();
   const add = (g,w)=> bag.set(g,(bag.get(g)||0)+w);
   const mix = [...history, ...ratings];
@@ -70,7 +73,7 @@ export function profileFrom({history=[],ratings=[]}){
 EOF
 
 # -----------------------
-# src/ai.js  (OpenRouter)
+# src/ai.js  (OpenRouter with headers + /ai-debug support)
 # -----------------------
 RUN cat > src/ai.js <<'EOF'
 import fetch from 'node-fetch';
@@ -79,35 +82,67 @@ import fetch from 'node-fetch';
 export async function aiSuggest(profileMovies, profileSeries, max=80){
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) return [];
+
   const model = process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet';
-  const sys = `Output ONLY a JSON array. Each item: {"title":string,"year":number|undefined,"kind":"movie"|"series"|"anime"}.
-Rules: suggest NEW-to-user titles (assume anything supplied is already seen), slightly niche but likely to be enjoyed, cover movies/series/anime where applicable. No commentary.`;
+  const site = process.env.OPENROUTER_SITE_URL || process.env.SELF_BASE_URL || '';
+  const app  = process.env.OPENROUTER_APP_NAME || 'SimklPicks';
+
+  const sys = `You are a recommender. Output ONLY a JSON array.
+Each item: {"title":string,"year":number|undefined,"kind":"movie"|"series"|"anime"}.
+Suggest NEW-to-user titles (assume supplied profile are already seen/liked),
+lean slightly niche/under-discovered, cover movies/series/anime as appropriate. No commentary.`;
+
   const user = { max, profileMovies, profileSeries };
+
+  const body = {
+    model,
+    temperature: 0.4,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: sys },
+      { role: 'user', content: JSON.stringify(user) }
+    ]
+  };
+
+  const headers = {
+    'Authorization': `Bearer ${key}`,
+    'Content-Type': 'application/json'
+  };
+  if (site) headers['HTTP-Referer'] = site; // OpenRouter best practice
+  headers['X-Title'] = app;                 // OpenRouter best practice
 
   const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model, temperature: 0.4, response_format: { type: 'json_object' },
-      messages: [{role:'system',content:sys},{role:'user',content:JSON.stringify(user)}]
-    })
+    headers,
+    body: JSON.stringify(body)
   });
-  const j = await r.json().catch(()=>null);
+
+  const text = await r.text(); // capture raw for /ai-debug
+  let j; try { j = JSON.parse(text); } catch { j = null; }
+  globalThis.__AI_LAST_RAW__ = { status: r.status, ok: r.ok, text, parsed: j };
+
+  if (!r.ok) return [];
+
   const content = j?.choices?.[0]?.message?.content || '[]';
   try {
     const parsed = JSON.parse(content);
-    const arr = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.items) ? parsed.items : []);
-    return arr.map(x=>({
+    const arr = Array.isArray(parsed) ? parsed
+      : (Array.isArray(parsed.items) ? parsed.items : []);
+    return arr.map(x => ({
       title: String(x?.title||'').trim(),
       year: (x?.year!=null ? Number(x.year) || undefined : undefined),
       kind: (x?.kind==='anime'?'anime':(x?.kind==='series'?'series':'movie'))
     })).filter(x=>x.title);
-  } catch { return []; }
+  } catch {
+    return [];
+  }
 }
+
+export function getLastAiRaw(){ return globalThis.__AI_LAST_RAW__ || null; }
 EOF
 
 # -----------------------
-# src/tvdb.js  (robust resolver)
+# src/tvdb.js  (robust TVDB resolver)
 # -----------------------
 RUN cat > src/tvdb.js <<'EOF'
 import fetch from 'node-fetch';
@@ -121,12 +156,14 @@ async function tvdbLogin() {
   const pin = process.env.TVDB_PIN || '';
   const body = pin ? { apikey, pin } : { apikey };
   const r = await fetch(`${API}/login`, {
-    method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify(body)
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify(body)
   });
   if (!r.ok) throw new Error(`TVDB login ${r.status}`);
   const j = await r.json().catch(()=>null);
   TVDB_TOKEN = j?.data?.token || null;
-  TVDB_EXP = Date.now() + 24*3600*1000; // 1 day
+  TVDB_EXP = Date.now() + 24*3600*1000; // ~1 day
 }
 async function H() {
   if (!TVDB_TOKEN || Date.now() > TVDB_EXP) await tvdbLogin();
@@ -211,7 +248,7 @@ EOF
 RUN cat > src/index.js <<'EOF'
 import http from 'http';
 import { buckets, profileFrom } from './simkl.js';
-import { aiSuggest } from './ai.js';
+import { aiSuggest, getLastAiRaw } from './ai.js';
 import { toTvdbId } from './tvdb.js';
 
 const PORT = Number(process.env.PORT) || 7769;
@@ -219,11 +256,11 @@ const TTL  = Number(process.env.CACHE_TTL_MINUTES || 240) * 60 * 1000;
 
 const MANIFEST = {
   id: 'org.simkl.picks',
-  version: '4.0.0',
+  version: '4.1.0',
   name: 'SimklPicks (AI-only, TVDB)',
   description: 'AI-only novel recommendations from Simkl history & ratings; metadata via tvdb: IDs.',
   resources: ['catalog'],
-  types: ['movie','series'],   // anime is served as "series"
+  types: ['movie','series'],   // anime served as "series"
   idPrefixes: ['tvdb'],
   catalogs: [
     { type: 'movie',  id: 'simklpicks.recommended-movies', name: 'Simkl Picks • Movies (AI, unseen)' },
@@ -278,7 +315,7 @@ async function build(kind){
 const server = http.createServer((req,res)=>{
   const u = new URL(req.url, `http://${req.headers.host}`);
   const rawPath = u.pathname;
-  const path = rawPath.replace(/\.json$/i,''); // strip .json suffix for routing
+  const path = rawPath.replace(/\.json$/i,''); // strip .json
 
   if (path==='/' || path==='/health') return res.end('ok');
   if (rawPath==='/manifest.json' || path==='/manifest') return sendJSON(res, MANIFEST);
@@ -294,15 +331,34 @@ const server = http.createServer((req,res)=>{
     });
   }
 
-  // Raw AI output (exact items from OpenRouter)
+  // Simkl counts: ensure we actually have data
+  if (path==='/simkl-stats'){
+    (async ()=>{
+      const bm = await buckets('movie').catch(()=>({history:[],ratings:[]}));
+      const bs = await buckets('series').catch(()=>({history:[],ratings:[]}));
+      return sendJSON(res, {
+        movies: { history: bm.history?.length||0, ratings: bm.ratings?.length||0 },
+        series: { history: bs.history?.length||0, ratings: bs.ratings?.length||0 }
+      });
+    })().catch(()=> sendJSON(res, { movies:{history:0,ratings:0}, series:{history:0,ratings:0} }));
+    return;
+  }
+
+  // Raw AI output (what OpenRouter returned after parsing)
   if (path==='/ai-raw'){
     (async ()=>{
       const bMovie  = await buckets('movie').catch(()=>({history:[],ratings:[]}));
       const bSeries = await buckets('series').catch(()=>({history:[],ratings:[]}));
       const out = await aiSuggest(profileFrom(bMovie), profileFrom(bSeries), 90).catch(()=>[]);
-      return sendJSON(res, { items: out });
-    })().catch(()=> sendJSON(res,{ items: [], error:'ai error' }));
+      return sendJSON(res, { type: 'mixed', items: out });
+    })().catch(()=> sendJSON(res, { type:'mixed', items: [], error:'ai error' }));
     return;
+  }
+
+  // Last raw OpenRouter response (status + body)
+  if (path==='/ai-debug'){
+    const payload = getLastAiRaw();
+    return sendJSON(res, payload ? payload : { ok:false, note:'call /ai-raw once first' });
   }
 
   // Preview after filtering by type, before TVDB resolution
