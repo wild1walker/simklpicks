@@ -1,12 +1,12 @@
-# ===== SimklPicks: normalized + dual routes (/stremio/v1 + /catalog) =====
+# ===== SimklPicks (IDs-only) : dual routes + normalizer + debug =====
 FROM node:20-alpine
 WORKDIR /app
 
-# --- Minimal package.json (ESM with node-fetch) ---
+# --- Minimal package.json (ESM + node-fetch) ---
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "1.5.3",
+  "version": "1.5.5",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
   "dependencies": { "node-fetch": "^3.3.2" }
@@ -16,7 +16,7 @@ EOF
 RUN npm install --omit=dev
 RUN mkdir -p src
 
-# --- Simkl client (Bearer auth, safe error returns) ---
+# --- Simkl client (safe errors, Bearer auth header built from SIMKL_ACCESS_TOKEN) ---
 RUN cat > src/simklClient.js <<'EOF'
 import fetch from 'node-fetch';
 
@@ -60,7 +60,7 @@ export class SimklClient {
 }
 EOF
 
-# --- Server with normalizer, forced meta type, and dual routes ---
+# --- Server (IDs-only metas; lets your metadata addon resolve posters/titles) ---
 RUN cat > src/index.js <<'EOF'
 import http from 'http';
 import { SimklClient } from './simklClient.js';
@@ -69,9 +69,9 @@ const PORT = Number(process.env.PORT) || 7769;
 
 const manifest = {
   id: 'org.simkl.picks',
-  version: '1.5.3',
+  version: '1.5.5',
   name: 'SimklPicks',
-  description: 'Recommendations based on your Simkl watchlists/history',
+  description: 'Recommendations based on your Simkl watchlists/history (IDs only; metadata resolved by your other addon)',
   resources: ['catalog'],
   types: ['movie','series'],
   idPrefixes: ['tt','tmdb','tvdb'],
@@ -87,7 +87,8 @@ const simkl = new SimklClient({
   accessToken: process.env.SIMKL_ACCESS_TOKEN
 });
 
-// === Utility functions ===
+// ---- helpers ----
+// Prefer IMDb (tt…), else TMDB/TVDB, else slug
 const pickId = (b = {}) => {
   const ids = b.ids || {};
   if (ids.imdb) return String(ids.imdb).startsWith('tt') ? ids.imdb : `tt${ids.imdb}`;
@@ -96,16 +97,13 @@ const pickId = (b = {}) => {
   return b.slug || String(Math.random()).slice(2);
 };
 
-// 🔧 allows forcing the meta type (so Stremio accepts it for that catalog)
+// Minimal metas (id + type; optional name kept for UX but your metadata addon will override)
 const toMeta = (x, forcedType) => {
   const b = x.movie || x.show || x.anime || x || {};
   return {
     id: pickId(b),
     type: forcedType,
-    name: b.title || b.name || 'Untitled',
-    poster: b.poster || b.image || undefined,
-    posterShape: 'poster',
-    year: b.year
+    name: b.title || b.name || 'Untitled'
   };
 };
 
@@ -119,7 +117,7 @@ function sendJson(res, obj, code = 200) {
   res.end(s);
 }
 
-// Normalize Simkl responses (some endpoints return {movies:[...]}, etc.)
+// Normalize Simkl response shapes (some endpoints return {movies:[...]}, etc.)
 function normalizeListBody(b) {
   if (Array.isArray(b)) return b;
   if (b && Array.isArray(b.movies)) return b.movies;
@@ -137,19 +135,17 @@ async function safeList(callPromise, forcedType) {
   return { metas: list.map(x => toMeta(x, forcedType)).slice(0, 50), error: null };
 }
 
-// === HTTP Server ===
 http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const parts = url.pathname.split('/').filter(Boolean);
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      return res.end('ok');
+      res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('ok');
     }
     if (url.pathname === '/manifest.json') return sendJson(res, manifest);
 
-    // Debug routes
+    // Debug endpoints
     if (url.pathname === '/debug-auth') {
       const test = await simkl.watchlistMovies();
       return sendJson(res, {
@@ -177,7 +173,7 @@ http.createServer(async (req, res) => {
       return sendJson(res, out);
     }
 
-    // === Catalog endpoints (support both new and legacy paths) ===
+    // ---- Catalog routes (support both new and legacy paths) ----
     // /stremio/v1/catalog/<type>/<id>.json  OR  /catalog/<type>/<id>.json
     const isNew = parts[0] === 'stremio' && parts[1] === 'v1' && parts[2] === 'catalog';
     const isOld = parts[0] === 'catalog';
@@ -207,8 +203,7 @@ http.createServer(async (req, res) => {
       return sendJson(res, { metas: result.metas }, 200);
     }
 
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not found');
+    res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
   } catch (e) {
     sendJson(res, { error: { source: 'server', message: String(e?.message || e) } }, 200);
   }
