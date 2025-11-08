@@ -2,10 +2,11 @@
 FROM node:20-alpine
 WORKDIR /app
 
+# --- Minimal package.json (ESM with node-fetch) ---
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
   "dependencies": { "node-fetch": "^3.3.2" }
@@ -15,7 +16,7 @@ EOF
 RUN npm install --omit=dev
 RUN mkdir -p src
 
-# ---- Simkl client (Bearer auth, safe error returns) ----
+# --- Simkl client (Bearer auth, safe error returns) ---
 RUN cat > src/simklClient.js <<'EOF'
 import fetch from 'node-fetch';
 
@@ -59,7 +60,7 @@ export class SimklClient {
 }
 EOF
 
-# ---- Server with normalizer + dual routes ----
+# --- Server with normalizer, forced meta type, and dual routes ---
 RUN cat > src/index.js <<'EOF'
 import http from 'http';
 import { SimklClient } from './simklClient.js';
@@ -68,7 +69,7 @@ const PORT = Number(process.env.PORT) || 7769;
 
 const manifest = {
   id: 'org.simkl.picks',
-  version: '1.5.2',
+  version: '1.5.3',
   name: 'SimklPicks',
   description: 'Recommendations based on your Simkl watchlists/history',
   resources: ['catalog'],
@@ -86,26 +87,29 @@ const simkl = new SimklClient({
   accessToken: process.env.SIMKL_ACCESS_TOKEN
 });
 
-// ---- helpers ----
-const pickId = (b={}) => {
+// === Utility functions ===
+const pickId = (b = {}) => {
   const ids = b.ids || {};
   if (ids.imdb) return String(ids.imdb).startsWith('tt') ? ids.imdb : `tt${ids.imdb}`;
   if (ids.tmdb) return `tmdb:${ids.tmdb}`;
   if (ids.tvdb) return `tvdb:${ids.tvdb}`;
   return b.slug || String(Math.random()).slice(2);
 };
-const toMeta = (x) => {
+
+// 🔧 allows forcing the meta type (so Stremio accepts it for that catalog)
+const toMeta = (x, forcedType) => {
   const b = x.movie || x.show || x.anime || x || {};
   return {
     id: pickId(b),
-    type: b.type === 'movie' ? 'movie' : 'series',
+    type: forcedType,
     name: b.title || b.name || 'Untitled',
     poster: b.poster || b.image || undefined,
     posterShape: 'poster',
     year: b.year
   };
 };
-function sendJson(res, obj, code=200) {
+
+function sendJson(res, obj, code = 200) {
   const s = JSON.stringify(obj);
   res.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -114,7 +118,8 @@ function sendJson(res, obj, code=200) {
   });
   res.end(s);
 }
-// ---- NEW: normalize Simkl response shapes ----
+
+// Normalize Simkl responses (some endpoints return {movies:[...]}, etc.)
 function normalizeListBody(b) {
   if (Array.isArray(b)) return b;
   if (b && Array.isArray(b.movies)) return b.movies;
@@ -124,32 +129,36 @@ function normalizeListBody(b) {
   if (b && Array.isArray(b.data))   return b.data;
   return [];
 }
-async function safeList(callPromise) {
+
+async function safeList(callPromise, forcedType) {
   const r = await callPromise;
   if (!r.ok) return { metas: [], error: r };
   const list = normalizeListBody(r.body);
-  return { metas: list.map(toMeta).slice(0,50), error: null };
+  return { metas: list.map(x => toMeta(x, forcedType)).slice(0, 50), error: null };
 }
 
+// === HTTP Server ===
 http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const parts = url.pathname.split('/').filter(Boolean);
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      res.writeHead(200, {'Content-Type':'text/plain'}); return res.end('ok');
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      return res.end('ok');
     }
     if (url.pathname === '/manifest.json') return sendJson(res, manifest);
 
-    // Strong auth check (will never 500)
+    // Debug routes
     if (url.pathname === '/debug-auth') {
       const test = await simkl.watchlistMovies();
       return sendJson(res, {
         ok: !!process.env.SIMKL_API_KEY && !!process.env.SIMKL_ACCESS_TOKEN && test.ok,
         hasApiKey: !!process.env.SIMKL_API_KEY,
         hasAccessToken: !!process.env.SIMKL_ACCESS_TOKEN,
-        testCall: test.ok ? { ok:true, count: normalizeListBody(test.body).length } :
-                            { ok:false, status:test.status, statusText:test.statusText, body:test.body }
+        testCall: test.ok
+          ? { ok: true, count: normalizeListBody(test.body).length }
+          : { ok: false, status: test.status, statusText: test.statusText, body: test.body }
       });
     }
 
@@ -162,13 +171,13 @@ http.createServer(async (req, res) => {
       const out = {};
       for (const fn of fns) {
         const r = await simkl[fn]();
-        out[fn] = r.ok ? normalizeListBody(r.body).length :
-                         { status:r.status, statusText:r.statusText, body:r.body };
+        out[fn] = r.ok ? normalizeListBody(r.body).length
+                       : { status: r.status, statusText: r.statusText, body: r.body };
       }
       return sendJson(res, out);
     }
 
-    // ---- Catalog routes: support both new and old paths ----
+    // === Catalog endpoints (support both new and legacy paths) ===
     // /stremio/v1/catalog/<type>/<id>.json  OR  /catalog/<type>/<id>.json
     const isNew = parts[0] === 'stremio' && parts[1] === 'v1' && parts[2] === 'catalog';
     const isOld = parts[0] === 'catalog';
@@ -177,29 +186,31 @@ http.createServer(async (req, res) => {
       const id   = (isNew ? parts[4] : parts[2] || '').replace(/\.json$/i, '');
 
       let result = { metas: [], error: null };
+
       if (id === 'simklpicks.recommended-movies' && type === 'movie') {
-        result = await safeList(simkl.watchlistMovies());
-        if (!result.metas.length && !result.error) result = await safeList(simkl.ratingsMovies());
-        if (!result.metas.length && !result.error) result = await safeList(simkl.historyMovies());
+        result = await safeList(simkl.watchlistMovies(), 'movie');
+        if (!result.metas.length && !result.error) result = await safeList(simkl.ratingsMovies(), 'movie');
+        if (!result.metas.length && !result.error) result = await safeList(simkl.historyMovies(), 'movie');
       } else if (id === 'simklpicks.recommended-series' && type === 'series') {
-        result = await safeList(simkl.watchlistShows());
-        if (!result.metas.length && !result.error) result = await safeList(simkl.ratingsShows());
-        if (!result.metas.length && !result.error) result = await safeList(simkl.historyShows());
+        result = await safeList(simkl.watchlistShows(), 'series');
+        if (!result.metas.length && !result.error) result = await safeList(simkl.ratingsShows(), 'series');
+        if (!result.metas.length && !result.error) result = await safeList(simkl.historyShows(), 'series');
       } else if (id === 'simklpicks.recommended-anime' && type === 'series') {
-        result = await safeList(simkl.watchlistAnime());
-        if (!result.metas.length && !result.error) result = await safeList(simkl.ratingsAnime());
-        if (!result.metas.length && !result.error) result = await safeList(simkl.historyAnime());
+        result = await safeList(simkl.watchlistAnime(), 'series');
+        if (!result.metas.length && !result.error) result = await safeList(simkl.ratingsAnime(), 'series');
+        if (!result.metas.length && !result.error) result = await safeList(simkl.historyAnime(), 'series');
       }
 
       if (result.error && result.error.status) {
-        return sendJson(res, { metas: [], error: { source:'simkl', ...result.error } }, 200);
+        return sendJson(res, { metas: [], error: { source: 'simkl', ...result.error } }, 200);
       }
       return sendJson(res, { metas: result.metas }, 200);
     }
 
-    res.writeHead(404, {'Content-Type':'text/plain'}); res.end('Not found');
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
   } catch (e) {
-    sendJson(res, { error: { source:'server', message: String(e?.message || e) } }, 200);
+    sendJson(res, { error: { source: 'server', message: String(e?.message || e) } }, 200);
   }
 }).listen(PORT, () => {
   console.log(`[SimklPicks] listening on :${PORT}`);
