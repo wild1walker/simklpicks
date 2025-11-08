@@ -5,7 +5,7 @@ WORKDIR /app
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
   "dependencies": { "node-fetch": "^3.3.2" }
@@ -28,8 +28,11 @@ function H() {
     'Content-Type': 'application/json',
     'simkl-api-key': process.env.SIMKL_API_KEY || ''
   };
-  // NOTE: Simkl expects NO "Bearer " prefix
-  if (process.env.SIMKL_ACCESS_TOKEN) h['Authorization'] = process.env.SIMKL_ACCESS_TOKEN;
+  const tok = process.env.SIMKL_ACCESS_TOKEN || '';
+  if (tok) {
+    // Set SIMKL_BEARER=1 if your token requires "Bearer <token>"
+    h['Authorization'] = (process.env.SIMKL_BEARER === '1') ? `Bearer ${tok}` : tok;
+  }
   return h;
 }
 async function jget(path, q = {}) {
@@ -59,7 +62,7 @@ export async function userShows(){
   ]);
   return {history,ratings,watchlist};
 }
-export async function userAnime(){ // anime shares shows buckets
+export async function userAnime(){ // anime uses shows buckets
   const [history,ratings,watchlist] = await Promise.all([
     jget('/sync/history/shows', ext).catch(()=>[]),
     jget('/sync/ratings/shows', ext).catch(()=>[]),
@@ -74,11 +77,11 @@ export function simklIdOf(x){
   return b?.ids?.simkl ?? b?.simkl_id ?? b?.id ?? null;
 }
 
-// ------- details (ensures external IDs are present) -------
+// details (to fetch external IDs)
 export async function detailsMovie(simklId){ return jget(`/movies/${simklId}`, ext); }
 export async function detailsShow(simklId){  return jget(`/shows/${simklId}`,  ext); }
 
-// ------- wide pools (with graceful failure) ---------------
+// wide pools (graceful on 404)
 async function tryList(path){ try { return await jget(path, ext); } catch { return []; } }
 export async function poolMoviesWide() {
   const lists = await Promise.all([
@@ -97,7 +100,7 @@ export async function poolShowsWide() {
   return lists.flat().filter(Boolean);
 }
 
-// ------- profile from history+ratings (not watchlist) ----
+// profile from history+ratings (not watchlist)
 function genreBagFrom(items) {
   const bag = new Map();
   const add = (g, w=1)=> bag.set(g, (bag.get(g)||0)+w);
@@ -124,7 +127,7 @@ export async function buildProfile(kind) {
   return genreBagFrom(base);
 }
 
-// ------- personalized (non-AI) candidates ----------------
+// personalized (non-AI) candidates
 export async function candidatesMoviesPersonalized() {
   const pool = await poolMoviesWide();
   const bag  = await buildProfile('movie');
@@ -148,7 +151,7 @@ export async function filterAnimeFromShows(shows){
   });
 }
 
-// ------- search helpers (used by AI + fallbacks) ---------
+// search helpers (AI + fallbacks)
 export async function searchMovieByTitleYear(title, year){
   const r = await jget('/search/movies', { q: title, year }).catch(()=>[]);
   return Array.isArray(r) ? r : [];
@@ -175,19 +178,25 @@ function normalizeImdb(v){
   const s = String(v);
   return s.startsWith('tt') ? s : `tt${s}`;
 }
-function pickIdFor(kind, ids) {
-  if (!ids) return null;
-  if (kind === 'movie') return ids.tmdb ?? ids.imdb ?? ids.tvdb ?? null;
-  return ids.tvdb ?? ids.tmdb ?? ids.imdb ?? null; // series/anime
-}
+// movies => tmdb: -> tt... -> tvdb:
+// series/anime => tvdb: -> tmdb: -> tt...
 function toMetaId(kind, idsRaw) {
   if (!idsRaw) return null;
   const ids = { ...idsRaw };
-  if (ids.imdb) ids.imdb = normalizeImdb(ids.imdb);
-  const chosen = pickIdFor(kind, ids);
-  return chosen == null ? null : String(chosen);
-}
+  const imdb = normalizeImdb(ids.imdb);
 
+  if (kind === 'movie') {
+    if (ids.tmdb != null) return `tmdb:${ids.tmdb}`;
+    if (imdb)            return imdb;
+    if (ids.tvdb != null) return `tvdb:${ids.tvdb}`;
+    return null;
+  } else { // series or anime
+    if (ids.tvdb != null) return `tvdb:${ids.tvdb}`;
+    if (ids.tmdb != null) return `tmdb:${ids.tmdb}`;
+    if (imdb)            return imdb;
+    return null;
+  }
+}
 async function enrich(kind, item){
   const sid = simklIdOf(item);
   if (sid == null) return null;
@@ -197,7 +206,6 @@ async function enrich(kind, item){
     return { title: b.title || b.name, year: b.year || b.first_aired, ids: b.ids || {} };
   } catch { return null; }
 }
-
 export async function buildMetas(items, kind, { limit=50, concurrency=6 } = {}){
   const metas = [];
   let i = 0;
@@ -223,18 +231,18 @@ export async function buildMetas(items, kind, { limit=50, concurrency=6 } = {}){
 EOF
 
 # =========================
-#  aiSuggest.js (OpenRouter)
+#  aiSuggest.js (OpenRouter optional)
 # =========================
 RUN cat > src/aiSuggest.js <<'EOF'
 import fetch from 'node-fetch';
 
-// Returns [{title,year}] suggested by the model; no reranking.
+// Returns array of {title,year} suggested by the model (no reranking).
 export async function aiSuggestTitles(kind, profileSummary, limit=60) {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) return [];
   const model = process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet';
   const sys = `Generate ${kind} recommendations based ONLY on the user's viewing profile.
-Output a JSON array of {"title":string,"year":number|string}. Only titles likely in major catalogs. No prose.`;
+Output a JSON array of {"title":string,"year":number|string}. No prose.`;
 
   const user = { kind, profile: profileSummary, max: limit };
 
@@ -283,15 +291,16 @@ import { aiSuggestTitles } from './aiSuggest.js';
 
 const PORT = Number(process.env.PORT) || 7769;
 const TTL_MIN = Number(process.env.CACHE_TTL_MINUTES || 360);
-const EXCLUDE = new Set((process.env.EXCLUDE_SOURCES || 'history,ratings,watchlist').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean));
+const EXCLUDE = new Set((process.env.EXCLUDE_SOURCES || 'history,ratings,watchlist')
+  .split(',').map(s=>s.trim().toLowerCase()).filter(Boolean));
 
 const cache = new Map();
 const now = ()=>Date.now();
-const expired = (t)=> now()>t;
+const expired = (t)=> Date.now()>t;
 
 const manifest = {
   id: 'org.simkl.picks',
-  version: '2.4.0',
+  version: '2.5.0',
   name: 'SimklPicks (AI Suggestions)',
   description: 'AI-suggested unseen picks from your Simkl profile; Movies emit TMDB ids, Series/Anime emit TVDB ids for aiometadata.',
   resources: ['catalog'],
@@ -417,7 +426,7 @@ async function makeCatalog(kind){
     return id==null ? true : !seen.has(String(id));
   });
 
-  // 5) Enrich → external IDs → metas
+  // 5) Enrich → external IDs → metas (with prefixed IDs)
   return buildMetas(filtered, kind, { limit: 50, concurrency: 6 });
 }
 
