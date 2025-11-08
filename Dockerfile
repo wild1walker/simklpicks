@@ -5,7 +5,7 @@ WORKDIR /app
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
   "dependencies": { "node-fetch": "^3.3.2" }
@@ -28,7 +28,7 @@ function H() {
     'Content-Type': 'application/json',
     'simkl-api-key': process.env.SIMKL_API_KEY || ''
   };
-  // IMPORTANT: Simkl expects NO "Bearer " prefix
+  // NOTE: Simkl expects NO "Bearer " prefix
   if (process.env.SIMKL_ACCESS_TOKEN) h['Authorization'] = process.env.SIMKL_ACCESS_TOKEN;
   return h;
 }
@@ -41,7 +41,6 @@ async function jget(path, q = {}) {
   if (!r.ok) throw new Error(`${r.status} ${r.statusText} ${path}`);
   return body;
 }
-
 const ext = { extended: 'full' };
 
 export async function userMovies(){ 
@@ -69,46 +68,43 @@ export async function userAnime(){ // anime shares shows buckets
   return {history,ratings,watchlist};
 }
 
-export function baseFromItem(x){
-  return x?.movie || x?.show || x || {};
-}
+export function baseFromItem(x){ return x?.movie || x?.show || x || {}; }
 export function simklIdOf(x){
   const b = baseFromItem(x);
   return b?.ids?.simkl ?? b?.simkl_id ?? b?.id ?? null;
 }
 
-// -------- details lookups (ensures external IDs are present) --------
+// ------- details (ensures external IDs are present) -------
 export async function detailsMovie(simklId){ return jget(`/movies/${simklId}`, ext); }
 export async function detailsShow(simklId){  return jget(`/shows/${simklId}`,  ext); }
 
-// -------- pool helpers (wide sources that exist for all keys) -------
-async function poolMoviesWide() {
+// ------- wide pools (with graceful failure) ---------------
+async function tryList(path){ try { return await jget(path, ext); } catch { return []; } }
+export async function poolMoviesWide() {
   const lists = await Promise.all([
-    jget('/movies/top',      ext).catch(()=>[]),
-    jget('/movies/popular',  ext).catch(()=>[]),
-    jget('/movies/trending', ext).catch(()=>[])
+    tryList('/movies/top'),
+    tryList('/movies/popular'),
+    tryList('/movies/trending')
   ]);
   return lists.flat().filter(Boolean);
 }
-async function poolShowsWide() {
+export async function poolShowsWide() {
   const lists = await Promise.all([
-    jget('/shows/top',      ext).catch(()=>[]),
-    jget('/shows/popular',  ext).catch(()=>[]),
-    jget('/shows/trending', ext).catch(()=>[])
+    tryList('/shows/top'),
+    tryList('/shows/popular'),
+    tryList('/shows/trending')
   ]);
   return lists.flat().filter(Boolean);
 }
 
-// -------- profile from your history + ratings (not watchlist) -------
+// ------- profile from history+ratings (not watchlist) ----
 function genreBagFrom(items) {
   const bag = new Map();
   const add = (g, w=1)=> bag.set(g, (bag.get(g)||0)+w);
   for (const x of items || []) {
     const b = baseFromItem(x);
     const gs = b.genres || b.genre || [];
-    const weight =
-      x?.rating ? (Number(x.rating)||1) :
-      (x?.watched_at ? 1.0 : 0.5);
+    const weight = x?.rating ? (Number(x.rating)||1) : (x?.watched_at ? 1.0 : 0.5);
     for (const g of gs) if (g) add(String(g).toLowerCase(), weight);
   }
   return bag;
@@ -119,33 +115,29 @@ function scoreByGenres(item, bag) {
   let s = 0;
   for (const g of gs) s += bag.get(String(g||'').toLowerCase()) || 0;
   const yr = Number(b.year || b.first_aired || 0);
-  if (yr) s += Math.max(0, (yr - 1990)) * 0.01; // tiny recency nudge
+  if (yr) s += Math.max(0, (yr - 1990)) * 0.01;
   return s;
 }
 export async function buildProfile(kind) {
   const buckets = (kind === 'movie') ? await userMovies() : await userShows();
-  const base = []
-    .concat(buckets.history || [])
-    .concat(buckets.ratings || []); // OMIT watchlist to avoid echo
+  const base = [].concat(buckets.history || []).concat(buckets.ratings || []);
   return genreBagFrom(base);
 }
 
-// -------- personalized (non-AI) candidates -------------------------
+// ------- personalized (non-AI) candidates ----------------
 export async function candidatesMoviesPersonalized() {
   const pool = await poolMoviesWide();
   const bag  = await buildProfile('movie');
-  return pool
-    .map(it => ({ it, s: scoreByGenres(it, bag) }))
-    .sort((a,b) => b.s - a.s)
-    .map(x => x.it);
+  return pool.map(it => ({ it, s: scoreByGenres(it, bag) }))
+             .sort((a,b) => b.s - a.s)
+             .map(x => x.it);
 }
 export async function candidatesShowsPersonalized() {
   const pool = await poolShowsWide();
   const bag  = await buildProfile('series');
-  return pool
-    .map(it => ({ it, s: scoreByGenres(it, bag) }))
-    .sort((a,b) => b.s - a.s)
-    .map(x => x.it);
+  return pool.map(it => ({ it, s: scoreByGenres(it, bag) }))
+             .sort((a,b) => b.s - a.s)
+             .map(x => x.it);
 }
 export async function filterAnimeFromShows(shows){
   return (shows||[]).filter(s=>{
@@ -155,18 +147,19 @@ export async function filterAnimeFromShows(shows){
     return false;
   });
 }
-export async function candidatesAnimePersonalized() {
-  const rankedShows = await candidatesShowsPersonalized();
-  return filterAnimeFromShows(rankedShows);
-}
 
-// -------- Simkl search by title/year (for AI suggestions) ----------
+// ------- search helpers (used by AI + fallbacks) ---------
 export async function searchMovieByTitleYear(title, year){
   const r = await jget('/search/movies', { q: title, year }).catch(()=>[]);
   return Array.isArray(r) ? r : [];
 }
 export async function searchShowByTitleYear(title, year){
   const r = await jget('/search/shows', { q: title, year }).catch(()=>[]);
+  return Array.isArray(r) ? r : [];
+}
+export async function searchShowsByKeyword(q, limit=25){
+  if (!q) return [];
+  const r = await jget('/search/shows', { q, limit }).catch(()=>[]);
   return Array.isArray(r) ? r : [];
 }
 EOF
@@ -177,23 +170,22 @@ EOF
 RUN cat > src/buildCatalog.js <<'EOF'
 import { detailsMovie, detailsShow, baseFromItem, simklIdOf } from './simklClient.js';
 
-// aiometadata id format:
-//   movie  -> TMDB number
-//   series -> TVDB number
-//   anime  -> TVDB number (Stremio "type" is still "series")
-function aioId(ids, kind){
+function normalizeImdb(v){
+  if (!v) return null;
+  const s = String(v);
+  return s.startsWith('tt') ? s : `tt${s}`;
+}
+function pickIdFor(kind, ids) {
   if (!ids) return null;
-  if (kind==='movie'){
-    return (ids.tmdb!=null) ? String(ids.tmdb)
-         : (ids.imdb!=null) ? (String(ids.imdb).startsWith('tt') ? String(ids.imdb) : `tt${ids.imdb}`)
-         : (ids.tvdb!=null) ? String(ids.tvdb)
-         : null;
-  }
-  // series / anime prefer tvdb
-  return (ids.tvdb!=null) ? String(ids.tvdb)
-       : (ids.tmdb!=null) ? String(ids.tmdb)
-       : (ids.imdb!=null) ? (String(ids.imdb).startsWith('tt') ? String(ids.imdb) : `tt${ids.imdb}`)
-       : null;
+  if (kind === 'movie') return ids.tmdb ?? ids.imdb ?? ids.tvdb ?? null;
+  return ids.tvdb ?? ids.tmdb ?? ids.imdb ?? null; // series/anime
+}
+function toMetaId(kind, idsRaw) {
+  if (!idsRaw) return null;
+  const ids = { ...idsRaw };
+  if (ids.imdb) ids.imdb = normalizeImdb(ids.imdb);
+  const chosen = pickIdFor(kind, ids);
+  return chosen == null ? null : String(chosen);
 }
 
 async function enrich(kind, item){
@@ -214,7 +206,7 @@ export async function buildMetas(items, kind, { limit=50, concurrency=6 } = {}){
     const enriched = await Promise.all(chunk.map(x => enrich(kind, x)));
     for (const e of enriched){
       if (!e) continue;
-      const id = aioId(e.ids, kind);
+      const id = toMetaId(kind, e.ids);
       if (!id) continue;
       metas.push({
         id,
@@ -236,32 +228,22 @@ EOF
 RUN cat > src/aiSuggest.js <<'EOF'
 import fetch from 'node-fetch';
 
-// Returns an array of { title, year } suggested by the model.
-// We pass a compact profile summary; model proposes *new* titles, not ranking.
+// Returns [{title,year}] suggested by the model; no reranking.
 export async function aiSuggestTitles(kind, profileSummary, limit=60) {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) return [];
-
   const model = process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet';
-  const sys = `You generate ${kind} recommendations based ONLY on the user's viewing profile.
-Output a JSON array of objects with keys: "title" (string), "year" (number or string). No prose. No duplicates. Prefer well-known titles that can be found in common databases. Do NOT include anything the user is likely to have already watched if it sounds like a canonical franchise entry without novel twist.`;
+  const sys = `Generate ${kind} recommendations based ONLY on the user's viewing profile.
+Output a JSON array of {"title":string,"year":number|string}. Only titles likely in major catalogs. No prose.`;
 
-  const user = {
-    kind,
-    profile: profileSummary, // {genres:[{name,weight}], recencyBias:number}
-    max: limit
-  };
+  const user = { kind, profile: profileSummary, max: limit };
 
   try {
     const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model,
-        temperature: 0.3,
+        model, temperature: 0.3,
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: sys },
@@ -274,12 +256,10 @@ Output a JSON array of objects with keys: "title" (string), "year" (number or st
     try {
       const parsed = JSON.parse(content);
       const arr = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.items) ? parsed.items : []);
-      return arr
-        .map(x => ({
-          title: String(x?.title || '').trim(),
-          year:  Number(x?.year) || (typeof x?.year === 'string' ? x.year : undefined)
-        }))
-        .filter(x => x.title);
+      return arr.map(x => ({
+        title: String(x?.title || '').trim(),
+        year:  Number(x?.year) || (typeof x?.year === 'string' ? x.year : undefined)
+      })).filter(x => x.title);
     } catch { return []; }
   } catch { return []; }
 }
@@ -293,10 +273,10 @@ import http from 'http';
 import {
   userMovies, userShows,
   candidatesMoviesPersonalized,
-  candidatesShowsPersonalized,
-  candidatesAnimePersonalized,
+  candidatesShowsPersonalized, filterAnimeFromShows,
   searchMovieByTitleYear, searchShowByTitleYear,
-  baseFromItem, simklIdOf
+  baseFromItem, simklIdOf,
+  poolShowsWide, searchShowsByKeyword
 } from './simklClient.js';
 import { buildMetas } from './buildCatalog.js';
 import { aiSuggestTitles } from './aiSuggest.js';
@@ -311,7 +291,7 @@ const expired = (t)=> now()>t;
 
 const manifest = {
   id: 'org.simkl.picks',
-  version: '2.3.0',
+  version: '2.4.0',
   name: 'SimklPicks (AI Suggestions)',
   description: 'AI-suggested unseen picks from your Simkl profile; Movies emit TMDB ids, Series/Anime emit TVDB ids for aiometadata.',
   resources: ['catalog'],
@@ -345,25 +325,38 @@ async function seenSet(kind){
   return S;
 }
 
+// ---- helpers for AI + fallbacks ----
 function profileSummaryFrom(buckets){
   const bag = new Map();
   const add = (g,w)=> bag.set(g,(bag.get(g)||0)+w);
-  const mix = []
-    .concat(buckets.history||[])
-    .concat(buckets.ratings||[]);
+  const mix = [].concat(buckets.history||[]).concat(buckets.ratings||[]);
   for (const x of mix) {
     const b = x?.movie || x?.show || x || {};
     const gs = b.genres || b.genre || [];
-    const w  =
-      x?.rating ? (Number(x.rating)||1) :
-      (x?.watched_at ? 1.0 : 0.5);
+    const w  = x?.rating ? (Number(x.rating)||1) : (x?.watched_at ? 1.0 : 0.5);
     for (const g of gs) if (g) add(String(g).toLowerCase(), w);
   }
   const genres = Array.from(bag.entries()).map(([name,weight])=>({name,weight}));
-  // recency bias estimate: average (year - 1990)
   const years = mix.map(x => Number((x?.movie||x?.show||x||{}).year||0)).filter(Boolean);
   const recencyBias = years.length ? Math.max(0, (years.reduce((a,b)=>a+b,0)/years.length) - 1990) : 0;
   return { genres, recencyBias };
+}
+function topGenres(summary, n=6){
+  return (summary?.genres||[])
+    .slice()
+    .sort((a,b)=> (b.weight||0)-(a.weight||0))
+    .map(g=>g.name)
+    .filter(Boolean)
+    .slice(0,n);
+}
+function dedupeBySimklId(items){
+  const seen = new Set(); const out=[];
+  for (const x of items||[]) {
+    const id = simklIdOf(x);
+    const k = id==null ? JSON.stringify(x) : String(id);
+    if (!seen.has(k)) { seen.add(k); out.push(x); }
+  }
+  return out;
 }
 
 async function aiSuggestedPool(kind){
@@ -371,41 +364,48 @@ async function aiSuggestedPool(kind){
   const buckets = (kind==='movie') ? await userMovies() : await userShows();
   const summary = profileSummaryFrom(buckets);
   const titles = await aiSuggestTitles(kind, summary, 60); // [{title,year}]
-  // map AI suggestions back to Simkl items via search
   const results = [];
   for (const t of titles) {
     try {
       const arr = (kind==='movie')
         ? await searchMovieByTitleYear(t.title, t.year)
         : await searchShowByTitleYear(t.title, t.year);
-      if (arr && arr.length) results.push(arr[0]); // take best match
+      if (arr && arr.length) results.push(arr[0]); // best match
     } catch {}
   }
   return results;
 }
 
-function dedupeBySimklId(items){
-  const seen = new Set();
-  const out = [];
-  for (const x of items||[]) {
-    const id = simklIdOf(x);
-    const k = id==null ? JSON.stringify(x) : String(id);
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(x);
+async function showsFallbackFromGenres(){
+  const buckets = await userShows();
+  const summary = profileSummaryFrom(buckets);
+  const seeds = topGenres(summary, 6);
+  const pools = [];
+  for (const g of seeds) {
+    const hits = await searchShowsByKeyword(g, 25);
+    pools.push(...hits);
   }
-  return out;
+  // extra attempt for anime-specific
+  const animeHits = await searchShowsByKeyword('anime', 50);
+  pools.push(...animeHits);
+  return pools;
+}
+
+async function candidatesShowsSafe() {
+  const wide = await poolShowsWide();
+  if (wide && wide.length) return wide;
+  return await showsFallbackFromGenres();
 }
 
 async function makeCatalog(kind){
-  // 1) AI suggestions → Simkl search (if key present)
+  // 1) AI suggestions (optional)
   const aiPool = await aiSuggestedPool(kind);
 
-  // 2) Non-AI personalized pool (genre-profiled from wide lists)
+  // 2) Non-AI personalized
   let nonAi;
   if (kind==='movie')  nonAi = await candidatesMoviesPersonalized();
-  if (kind==='series') nonAi = await candidatesShowsPersonalized();
-  if (kind==='anime')  nonAi = await candidatesAnimePersonalized();
+  if (kind==='series') nonAi = await candidatesShowsSafe();
+  if (kind==='anime')  nonAi = filterAnimeFromShows(await candidatesShowsSafe());
 
   // 3) Merge + dedupe
   const merged = dedupeBySimklId([...(aiPool||[]), ...(nonAi||[])]);
@@ -417,7 +417,7 @@ async function makeCatalog(kind){
     return id==null ? true : !seen.has(String(id));
   });
 
-  // 5) Enrich + build metas (TMDB for movies, TVDB for series/anime)
+  // 5) Enrich → external IDs → metas
   return buildMetas(filtered, kind, { limit: 50, concurrency: 6 });
 }
 
@@ -441,8 +441,8 @@ http.createServer(async (req,res)=>{
       const ai   = await aiSuggestedPool(kind);
       let nonAi;
       if (kind==='movie')  nonAi = await candidatesMoviesPersonalized();
-      if (kind==='series') nonAi = await candidatesShowsPersonalized();
-      if (kind==='anime')  nonAi = await candidatesAnimePersonalized();
+      if (kind==='series') nonAi = await candidatesShowsSafe();
+      if (kind==='anime')  nonAi = filterAnimeFromShows(await candidatesShowsSafe());
       const merged = dedupeBySimklId([...(ai||[]), ...(nonAi||[])]);
       const out = norm(merged).slice(0,25).map(x => {
         const b = baseFromItem(x);
