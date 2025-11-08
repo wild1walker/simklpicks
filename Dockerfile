@@ -1,135 +1,256 @@
 FROM node:20-alpine
 WORKDIR /app
 
+# --- Minimal package.json ---
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "2.0.4",
+  "version": "2.1.0",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
-  "dependencies": { "node-fetch": "^3.3.2" }
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
 }
 EOF
 
 RUN npm install --omit=dev
 RUN mkdir -p src
 
-# --- Simkl client ---
+# =========================
+#  Simkl Client + Helpers
+# =========================
 RUN cat > src/simklClient.js <<'EOF'
 import fetch from 'node-fetch';
 
-export class SimklClient {
-  constructor({ apiKey, accessToken }) {
-    this.apiKey = apiKey || '';
-    this.accessToken = accessToken || '';
-    this.base = 'https://api.simkl.com';
-  }
-  headers() {
-    return {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'simkl-api-key': this.apiKey,
-      ...(this.accessToken ? { 'Authorization': `Bearer ${this.accessToken}` } : {})
-    };
-  }
-  async _get(path) {
+const API = 'https://api.simkl.com';
+
+function headers() {
+  const h = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'simkl-api-key': process.env.SIMKL_API_KEY || ''
+  };
+  // SIMKL expects NO "Bearer " prefix here (your past 401 proved this)
+  if (process.env.SIMKL_ACCESS_TOKEN) h['Authorization'] = process.env.SIMKL_ACCESS_TOKEN;
+  return h;
+}
+
+async function get(path, query = {}) {
+  const sp = new URLSearchParams(query);
+  const url = API + path + (sp.toString() ? `?${sp}` : '');
+  const r = await fetch(url, { headers: headers() });
+  const text = await r.text();
+  let body = null;
+  if (text) { try { body = JSON.parse(text); } catch { body = { raw: text }; } }
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText} GET ${path}`);
+  return body;
+}
+
+// Always ask for extended=full so Simkl returns external ids
+const ext = { extended: 'full' };
+
+// Robust external-ID resolver:
+// 1) Try Simkl /search/id with simkl ID if present
+// 2) Try Simkl /search/movies or /search/shows by title/year
+export async function resolveIds(item, kind) {
+  if (!item) return item;
+
+  const hasExt =
+    (item?.ids?.tmdb != null) ||
+    (item?.ids?.tvdb != null) ||
+    (item?.ids?.imdb != null);
+  if (hasExt) return item;
+
+  const simklId = item?.ids?.simkl ?? item?.simkl_id ?? item?.id;
+  const title = item?.title ?? item?.name;
+  const year  = item?.year ?? item?.first_aired;
+
+  // 1) lookup by simkl id
+  try {
+    if (simklId != null) {
+      const looked = await get('/search/id', { simkl: simklId });
+      if (looked && looked.ids) {
+        item.ids = { ...(item.ids||{}), ...looked.ids };
+        const ok = item.ids.tmdb != null || item.ids.tvdb != null || item.ids.imdb != null;
+        if (ok) return item;
+      }
+    }
+  } catch (_) {}
+
+  // 2) fallback: title/year search
+  try {
+    if (title) {
+      if (kind === 'movie') {
+        const res = await get('/search/movies', { q: title, year });
+        const hit = Array.isArray(res) ? res[0] : null;
+        if (hit?.ids) { item.ids = { ...(item.ids||{}), ...hit.ids }; return item; }
+      } else {
+        // series and anime live under /search/shows
+        const res = await get('/search/shows', { q: title, year });
+        const hit = Array.isArray(res) ? res[0] : null;
+        if (hit?.ids) { item.ids = { ...(item.ids||{}), ...hit.ids }; return item; }
+      }
+    }
+  } catch (_) {}
+
+  return item;
+}
+
+export async function userMovies() {
+  const [history, ratings, watchlist] = await Promise.all([
+    get('/sync/history/movies', ext).catch(() => []),
+    get('/sync/ratings/movies', ext).catch(() => []),
+    get('/sync/watchlist/movies', ext).catch(() => [])
+  ]);
+  return { history, ratings, watchlist };
+}
+
+export async function userShows() {
+  const [history, ratings, watchlist] = await Promise.all([
+    get('/sync/history/shows', ext).catch(() => []),
+    get('/sync/ratings/shows', ext).catch(() => []),
+    get('/sync/watchlist/shows', ext).catch(() => [])
+  ]);
+  return { history, ratings, watchlist };
+}
+
+// Anime is usually just a flagged subset of shows on Simkl
+export async function userAnime() {
+  const [history, ratings, watchlist] = await Promise.all([
+    get('/sync/history/shows', ext).catch(() => []),
+    get('/sync/ratings/shows', ext).catch(() => []),
+    get('/sync/watchlist/shows', ext).catch(() => [])
+  ]);
+  return { history, ratings, watchlist };
+}
+
+export async function candidatesMovies() {
+  // Try recommendations first, then stable fallbacks
+  const paths = [
+    ['/movies/recommendations', { limit: 200, extended: 'full' }],
+    ['/recommendations/movies', { limit: 200, extended: 'full' }],
+    ['/movies/trending',        { extended: 'full' }],
+    ['/movies/popular',         { extended: 'full' }],
+    ['/movies/top',             { extended: 'full' }]
+  ];
+  for (const [p,q] of paths) {
     try {
-      const r = await fetch(this.base + path, { headers: this.headers() });
-      const t = await r.text();
-      const body = t ? (()=>{ try { return JSON.parse(t); } catch { return { raw: t }; } })() : null;
-      if (!r.ok) return { ok:false, status:r.status, statusText:r.statusText, body, path };
-      return { ok:true, body, path };
-    } catch (e) {
-      return { ok:false, status:0, statusText:String(e?.message||e), body:null, path };
-    }
+      const res = await get(p, q);
+      if (Array.isArray(res) && res.length) return res;
+    } catch (_) {}
   }
+  return [];
+}
 
-  // seen sources
-  historyMovies()   { return this._get('/sync/history/movies'); }
-  ratingsMovies()   { return this._get('/sync/ratings/movies'); }
-  watchlistMovies() { return this._get('/sync/watchlist/movies'); }
+export async function candidatesShows() {
+  const paths = [
+    ['/shows/recommendations', { limit: 200, extended: 'full' }],
+    ['/recommendations/shows', { limit: 200, extended: 'full' }],
+    ['/shows/trending',        { extended: 'full' }],
+    ['/shows/popular',         { extended: 'full' }],
+    ['/shows/top',             { extended: 'full' }]
+  ];
+  for (const [p,q] of paths) {
+    try {
+      const res = await get(p, q);
+      if (Array.isArray(res) && res.length) return res;
+    } catch (_) {}
+  }
+  return [];
+}
 
-  historyShows()    { return this._get('/sync/history/shows'); }
-  ratingsShows()    { return this._get('/sync/ratings/shows'); }
-  watchlistShows()  { return this._get('/sync/watchlist/shows'); }
-
-  historyAnime()    { return this._get('/sync/history/anime'); }
-  ratingsAnime()    { return this._get('/sync/ratings/anime'); }
-  watchlistAnime()  { return this._get('/sync/watchlist/anime'); }
-
-  // candidates with fallbacks (+ optional force)
-  async candidatesMovies() {
-    const forced = process.env.FORCE_MOVIE_PATH;
-    const paths = forced ? [forced] : [
-      '/movies/recommendations','/recommendations/movies',
-      '/movies/trending','/movies/trending/today',
-      '/movies/popular','/movies/anticipated','/movies/top'
-    ];
-    return this._firstOk(paths);
-  }
-  async candidatesShows() {
-    const forced = process.env.FORCE_SERIES_PATH;
-    const paths = forced ? [forced] : [
-      '/shows/recommendations','/recommendations/shows',
-      '/shows/trending','/shows/trending/today',
-      '/shows/popular','/shows/anticipated','/shows/airing','/shows/top',
-      '/calendar/episodes/popular','/popular/shows'
-    ];
-    return this._firstOk(paths);
-  }
-  async candidatesAnime() {
-    const forced = process.env.FORCE_ANIME_PATH;
-    const paths = forced ? [forced] : [
-      '/anime/recommendations','/recommendations/anime',
-      '/anime/trending','/anime/trending/today',
-      '/anime/popular','/anime/anticipated','/anime/top',
-      // many anime appear in general shows lists
-      '/shows/trending','/shows/popular','/shows/top'
-    ];
-    return this._firstOk(paths);
-  }
-  async _firstOk(paths) {
-    const tried = [];
-    for (const p of paths) {
-      const r = await this._get(p);
-      tried.push({ path:p, ok:r.ok, status:r.status||200 });
-      if (r.ok && r.body) return { ...r, tried };
-    }
-    return { ok:false, status:404, statusText:'No candidate endpoint OK', body:null, tried };
-  }
+export async function filterAnimeFromShows(shows) {
+  // Accept common anime signals
+  return (shows || []).filter(s => {
+    const b = s?.show || s || {};
+    if (b?.anime === true) return true;
+    if (Array.isArray(b?.genres) && b.genres.some(g => String(g).toLowerCase()==='anime')) return true;
+    return false;
+  });
 }
 EOF
 
-# --- Server ---
+# =========================
+#  Catalog Builder
+# =========================
+RUN cat > src/buildCatalog.js <<'EOF'
+import { resolveIds } from './simklClient.js';
+
+// aiometadata wants:
+//   - MOVIES: plain TMDB numeric ID
+//   - SERIES/ANIME: plain TVDB numeric ID
+function chooseIdForAioMeta(ids, kind) {
+  if (!ids) return null;
+  if (kind === 'movie') {
+    // strict tmdb first; fallbacks only if absolutely necessary
+    return (ids.tmdb != null) ? String(ids.tmdb)
+         : (ids.imdb != null) ? (String(ids.imdb).startsWith('tt') ? String(ids.imdb) : `tt${ids.imdb}`)
+         : (ids.tvdb != null) ? String(ids.tvdb)
+         : null;
+  }
+  // series/anime -> tvdb first
+  return (ids.tvdb != null) ? String(ids.tvdb)
+       : (ids.tmdb != null) ? String(ids.tmdb)
+       : (ids.imdb != null) ? (String(ids.imdb).startsWith('tt') ? String(ids.imdb) : `tt${ids.imdb}`)
+       : null;
+}
+
+export async function buildMetas(list, kind, { limit = 50 } = {}) {
+  const metas = [];
+  for (const raw of list) {
+    const base = raw?.movie || raw?.show || raw || {};
+    const enriched = await resolveIds(base, kind);
+    const id = chooseIdForAioMeta(enriched?.ids, kind);
+    if (!id) continue;
+
+    metas.push({
+      id,
+      type: kind === 'anime' ? 'series' : kind,
+      name: enriched.title || enriched.name || 'Untitled',
+      year: enriched.year || enriched.first_aired || undefined
+      // no poster: you delegate posters to aiometadata
+    });
+    if (metas.length >= limit) break;
+  }
+  return metas;
+}
+EOF
+
+# =========================
+#  Main Server
+# =========================
 RUN cat > src/index.js <<'EOF'
 import http from 'http';
 import fetch from 'node-fetch';
-import { SimklClient } from './simklClient.js';
+import {
+  userMovies, userShows, userAnime,
+  candidatesMovies, candidatesShows, filterAnimeFromShows
+} from './simklClient.js';
+import { buildMetas } from './buildCatalog.js';
 
 const PORT = Number(process.env.PORT) || 7769;
 const TTL_MIN = Number(process.env.CACHE_TTL_MINUTES || 360);
-const EMIT_PLAIN = (process.env.EMIT_PLAIN_IDS ?? '1') === '1';
 
-// aiometadata-friendly defaults: plain TMDB for all unless you override via env
-const ORDER_GLOBAL = (process.env.PREFERRED_ID_ORDER || 'tmdb,tt,tvdb')
-  .split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-const ORDER_MOV = (process.env.PREFERRED_ID_ORDER_MOVIE  || 'tmdb,tt,tvdb').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-const ORDER_SER = (process.env.PREFERRED_ID_ORDER_SERIES || 'tmdb,tt,tvdb').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-const ORDER_ANI = (process.env.PREFERRED_ID_ORDER_ANIME  || 'tmdb,tt,tvdb').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-const ORDER = { movie: ORDER_MOV, series: ORDER_SER, anime: ORDER_ANI };
+// Strict unseen policy (like you asked):
+// exclude items found in ANY of: history, ratings, watchlist
+const EXCLUDE_SOURCES = new Set((process.env.EXCLUDE_SOURCES || 'history,ratings,watchlist')
+  .split(',').map(s=>s.trim().toLowerCase()).filter(Boolean));
 
-// choose which Simkl lists count as "seen"
-const SEEN_SOURCES = (process.env.SEEN_SOURCES || 'history,ratings')
-  .split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+// Simple cache
+const cache = new Map();
+const key = (k)=>`cat:${k}`;
+const now = ()=>Date.now();
+const expired = (t)=> now() > t;
 
 const manifest = {
   id: 'org.simkl.picks',
-  version: '2.0.4',
+  version: '2.1.0',
   name: 'SimklPicks (AI)',
-  description: 'AI re-ranked unseen recs from your Simkl profile (IDs only; metadata via your other addon)',
+  description: 'AI re-ranked unseen recs from your Simkl profile; emits TMDB ids for movies and TVDB ids for series/anime for aiometadata.',
   resources: ['catalog'],
   types: ['movie','series'],
-  idPrefixes: ['tt','tmdb','tvdb'],
+  idPrefixes: ['tmdb','tvdb','tt'],
   catalogs: [
     { type: 'series', id: 'simklpicks.recommended-series', name: 'Simkl Picks • Series (AI, unseen)' },
     { type: 'movie',  id: 'simklpicks.recommended-movies', name: 'Simkl Picks • Movies (AI, unseen)' },
@@ -137,221 +258,224 @@ const manifest = {
   ]
 };
 
-const simkl = new SimklClient({
-  apiKey: process.env.SIMKL_API_KEY,
-  accessToken: process.env.SIMKL_ACCESS_TOKEN
-});
-
-const cache = new Map();
-const k = (kind) => `cat:${kind}`;
-const now = () => Date.now();
-const expired = (t) => now() > t;
-
-// ----- ID helpers -----
-function chooseIdByOrder(idsObj = {}, order) {
-  for (const key of order) {
-    if ((key === 'tt' || key === 'imdb') && idsObj.imdb) {
-      return String(idsObj.imdb).startsWith('tt') ? idsObj.imdb : `tt${idsObj.imdb}`;
-    }
-    if (key === 'tmdb' && idsObj.tmdb != null) return EMIT_PLAIN ? String(idsObj.tmdb) : `tmdb:${idsObj.tmdb}`;
-    if (key === 'tvdb' && idsObj.tvdb != null) return EMIT_PLAIN ? String(idsObj.tvdb) : `tvdb:${idsObj.tvdb}`;
-  }
-  return null;
+function sendJson(res, obj, code=200) {
+  const s = JSON.stringify(obj);
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-store'
+  });
+  res.end(s);
 }
-const pickId = (b = {}, kind) => {
-  const ids = b.ids || {};
-  const chosen = chooseIdByOrder(ids, ORDER[kind] || ORDER_GLOBAL);
-  if (chosen) return chosen;
-  if (ids.imdb) return String(ids.imdb).startsWith('tt') ? ids.imdb : `tt${ids.imdb}`;
-  if (ids.tmdb != null) return EMIT_PLAIN ? String(ids.tmdb) : `tmdb:${ids.tmdb}`;
-  if (ids.tvdb != null) return EMIT_PLAIN ? String(ids.tvdb) : `tvdb:${ids.tvdb}`;
-  return b.slug || String(Math.random()).slice(2);
-};
 
-// normalize
-function norm(b) {
-  if (Array.isArray(b)) return b;
-  if (b && Array.isArray(b.movies)) return b.movies;
-  if (b && Array.isArray(b.shows))  return b.shows;
-  if (b && Array.isArray(b.anime))  return b.anime;
-  if (b && Array.isArray(b.items))  return b.items;
-  if (b && Array.isArray(b.data))   return b.data;
+function norm(list) {
+  if (Array.isArray(list)) return list;
+  if (list?.movies) return list.movies;
+  if (list?.shows)  return list.shows;
+  if (list?.items)  return list.items;
+  if (list?.data)   return list.data;
   return [];
 }
 
-// seen set per SEEN_SOURCES
-async function buildSeen(kind) {
-  const wants = new Set(SEEN_SOURCES);
-  const calls = [];
-  if (kind === 'movie') {
-    if (wants.has('history'))  calls.push(simkl.historyMovies());
-    if (wants.has('ratings'))  calls.push(simkl.ratingsMovies());
-    if (wants.has('watchlist'))calls.push(simkl.watchlistMovies());
-  } else if (kind === 'series') {
-    if (wants.has('history'))  calls.push(simkl.historyShows());
-    if (wants.has('ratings'))  calls.push(simkl.ratingsShows());
-    if (wants.has('watchlist'))calls.push(simkl.watchlistShows());
-  } else {
-    if (wants.has('history'))  calls.push(simkl.historyAnime());
-    if (wants.has('ratings'))  calls.push(simkl.ratingsAnime());
-    if (wants.has('watchlist'))calls.push(simkl.watchlistAnime());
-  }
-
-  const res = await Promise.all(calls);
+// Build a simkl id set from a bucket
+function toSimklIds(arr) {
   const S = new Set();
-  for (const r of res) if (r.ok) {
-    for (const x of norm(r.body)) {
-      const b = x.movie || x.show || x.anime || x || {};
-      const id = pickId(b, kind);
-      if (id) S.add(id);
-    }
+  for (const x of arr || []) {
+    const b = x?.movie || x?.show || x || {};
+    const id = b?.ids?.simkl ?? b?.simkl_id ?? b?.id;
+    if (id != null) S.add(String(id));
   }
   return S;
 }
 
-// candidates
-async function candidates(kind) {
-  return kind === 'movie' ? simkl.candidatesMovies()
-       : kind === 'series' ? simkl.candidatesShows()
-       : simkl.candidatesAnime();
+async function buildSeen(kind) {
+  // Pull your three user buckets for the content type
+  const { history, ratings, watchlist } =
+    kind === 'movie' ? await userMovies() :
+    kind === 'series' ? await userShows() :
+                        await userAnime();
+
+  const union = new Set();
+  if (EXCLUDE_SOURCES.has('history'))   for (const id of toSimklIds(norm(history)))   union.add(id);
+  if (EXCLUDE_SOURCES.has('ratings'))   for (const id of toSimklIds(norm(ratings)))   union.add(id);
+  if (EXCLUDE_SOURCES.has('watchlist')) for (const id of toSimklIds(norm(watchlist))) union.add(id);
+  return union;
 }
 
-// LLM rank (OpenRouter / OpenAI if configured)
-async function llmRank(kind, profile, candList) {
-  const want = Math.min(50, candList.length);
-  const sys = `You are a movie/TV recommender. Return ONLY a JSON array of up to ${want} objects with keys {id}. No prose.`;
-  const user = {
-    kind,
-    profile,
-    candidates: candList.map(c => ({
-      id: c.__id,
-      title: c.title || c.name || '',
-      year: c.year || c.first_aired || '',
-      genres: c.genres || c.genre || [],
-      rating: c.user_rating || c.rating || ''
-    }))
-  };
+async function makeCatalog(kind) {
+  // Get raw candidates
+  let candidates =
+    kind === 'movie'  ? await candidatesMovies() :
+    kind === 'series' ? await candidatesShows() :
+    await candidatesShows(); // anime from shows
+
+  if (kind === 'anime') candidates = await filterAnimeFromShows(candidates);
+
+  // Build unseen filter by simkl id
+  const seen = await buildSeen(kind);
+  const unseen = norm(candidates).filter(x => {
+    const b = x?.movie || x?.show || x || {};
+    const simklId = b?.ids?.simkl ?? b?.simkl_id ?? b?.id;
+    return simklId == null ? true : !seen.has(String(simklId));
+  });
+
+  // Optional LLM re-rank (kept simple; IDs must stay the same)
+  const ranked = await maybeRank(kind, unseen);
+
+  // Convert to Stremio metas with correct external id format
+  const metas = await buildMetas(ranked, kind, { limit: 50 });
+  return metas;
+}
+
+async function maybeRank(kind, arr) {
   const hasOR = !!process.env.OPENROUTER_API_KEY;
   const hasOA = !!process.env.OPENAI_API_KEY;
+  if (!hasOR && !hasOA) return arr; // no-op if you didn't configure a model
+
+  const want = Math.min(60, arr.length);
+  const sys = `You are a recommender. Return JSON array of up to ${want} objects with key {simkl_id}, no prose.`;
+  const user = {
+    kind,
+    candidates: arr.slice(0, 180).map(x => {
+      const b = x?.movie || x?.show || x || {};
+      const simklId = b?.ids?.simkl ?? b?.simkl_id ?? b?.id ?? '';
+      return {
+        simkl_id: String(simklId),
+        title: b.title || b.name || '',
+        year: b.year || b.first_aired || '',
+        genres: b.genres || b.genre || []
+      };
+    })
+  };
 
   try {
     if (hasOR) {
       const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet',
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet',
           messages: [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }],
-          temperature: 0.2, response_format: { type: "json_object" } })
+          temperature: 0.2,
+          response_format: { type: 'json_object' }
+        })
       });
       const j = await r.json().catch(()=>null);
       const content = j?.choices?.[0]?.message?.content || '[]';
-      return safeParseIdList(content);
-    }
-    if (hasOA) {
+      const ids = safeParseSimklIdList(content);
+      if (ids.length) {
+        const set = new Set(ids.map(String));
+        return arr.filter(x => {
+          const b = x?.movie || x?.show || x || {};
+          const simklId = b?.ids?.simkl ?? b?.simkl_id ?? b?.id;
+          return simklId != null && set.has(String(simklId));
+        });
+      }
+    } else if (hasOA) {
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: process.env.LLM_MODEL || 'gpt-4o-mini',
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: process.env.LLM_MODEL || 'gpt-4o-mini',
           messages: [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }],
-          temperature: 0.2, response_format: { type: "json_object" } })
+          temperature: 0.2,
+          response_format: { type: 'json_object' }
+        })
       });
       const j = await r.json().catch(()=>null);
       const content = j?.choices?.[0]?.message?.content || '[]';
-      return safeParseIdList(content);
+      const ids = safeParseSimklIdList(content);
+      if (ids.length) {
+        const set = new Set(ids.map(String));
+        return arr.filter(x => {
+          const b = x?.movie || x?.show || x || {};
+          const simklId = b?.ids?.simkl ?? b?.simkl_id ?? b?.id;
+          return simklId != null && set.has(String(simklId));
+        });
+      }
     }
   } catch (_) {}
-
-  return candList.slice(0, want).map(c => c.__id);
+  return arr;
 }
-function safeParseIdList(s) {
+
+function safeParseSimklIdList(s) {
   try {
     const j = JSON.parse(s);
     const arr = Array.isArray(j) ? j : (Array.isArray(j.items) ? j.items : []);
-    return arr.map(x => x.id).filter(Boolean);
+    return arr.map(x => x.simkl_id).filter(Boolean);
   } catch { return []; }
 }
 
-// build catalog
-async function buildCatalog(kind) {
-  const seen = await buildSeen(kind);
-  const candResp = await candidates(kind);
-  if (!candResp.ok) return { metas: [], tried: candResp.tried || [], error: { status: candResp.status, statusText: candResp.statusText } };
-
-  let pool = norm(candResp.body).map(x => x.movie || x.show || x.anime || x || {});
-  pool = pool.map(b => ({ ...b, __id: pickId(b, kind) })).filter(b => b.__id);
-  pool = pool.filter(b => !seen.has(b.__id)); // unseen
-
-  // simple profile for LLM
-  const genres = {};
-  for (const b of pool.slice(0,80)) {
-    for (const gg of Array.isArray(b.genres||b.genre)? (b.genres||b.genre) : String(b.genres||b.genre||'').split(',')) {
-      const key = String(gg).trim().toLowerCase(); if (key) genres[key]=(genres[key]||0)+1;
-    }
-  }
-  const profile = { top_genres: Object.entries(genres).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([g,c])=>`${g}(${c})`) };
-
-  const rankedIds = await llmRank(kind, profile, pool.slice(0,120));
-  const rankedSet = new Set(rankedIds);
-  const ordered = (rankedIds.length ? pool.filter(b => rankedSet.has(b.__id)) : pool).slice(0,50);
-
-  const metas = ordered.map(b => ({ id:b.__id, type:kind, name:b.title||b.name||'Untitled', year:b.year||b.first_aired||undefined }));
-  return { metas };
-}
-
-// HTTP
-function sendJson(res, obj, code=200) {
-  const s = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
-  res.end(s);
-}
-
+// ------------- HTTP server & routes -------------
 http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const parts = url.pathname.split('/').filter(Boolean);
 
-    if (url.pathname === '/' || url.pathname === '/health') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('ok'); }
-    if (url.pathname === '/manifest.json') return sendJson(res, {
-      ...${JSON.stringify({})}, // no-op to keep heredoc simple
-      ...${'{}'},
-      ... ( ()=> ({ ...manifest }) )()
-    });
-    if (url.pathname === '/refresh') { cache.clear(); return sendJson(res, { ok:true, cleared:true }); }
-
-    // ids preview
-    if (url.pathname === '/ids-preview') {
-      const kind = (url.searchParams.get('type') || 'movie').toLowerCase();
-      const r = await candidates(kind);
-      if (!r.ok) return sendJson(res, { error:{ status:r.status, statusText:r.statusText } }, 200);
-      const list = norm(r.body).map(x => x.movie||x.show||x.anime||x||{}).slice(0,20);
-      return sendJson(res, { type:kind, order:ORDER[kind], emitPlain:EMIT_PLAIN, items:list.map(b => ({ chosen: pickId(b, kind), ids:b.ids||{}, title:b.title||b.name })) });
+    if (url.pathname === '/' || url.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      return res.end('ok');
     }
 
-    // catalogs (new + legacy)
+    if (url.pathname === '/manifest.json') return sendJson(res, manifest);
+
+    if (url.pathname === '/env-check') {
+      return sendJson(res, {
+        ok: true,
+        hasApiKey: !!process.env.SIMKL_API_KEY,
+        hasAccessToken: !!process.env.SIMKL_ACCESS_TOKEN,
+        excludeSources: Array.from(EXCLUDE_SOURCES)
+      });
+    }
+
+    if (url.pathname === '/refresh') { cache.clear(); return sendJson(res, { ok:true, cleared:true }); }
+
+    if (url.pathname === '/ids-preview') {
+      const kind = (url.searchParams.get('type') || 'movie').toLowerCase();
+      // Use candidate layer; do not filter or resolve here, just show simkl ids for sanity
+      let cands = kind === 'movie' ? await candidatesMovies() : await candidatesShows();
+      if (kind === 'anime') cands = await filterAnimeFromShows(cands);
+      const items = (cands || []).slice(0, 25).map(x => {
+        const b = x?.movie || x?.show || x || {};
+        return {
+          title: b.title || b.name,
+          year: b.year || b.first_aired,
+          ids: b.ids || {}
+        };
+      });
+      return sendJson(res, { type: kind, items });
+    }
+
+    // Stremio catalog endpoints (new & legacy)
     const isNew = parts[0]==='stremio' && parts[1]==='v1' && parts[2]==='catalog';
     const isOld = parts[0]==='catalog';
     if (isNew || isOld) {
       const type = isNew ? parts[3] : parts[1];
       const id   = (isNew ? parts[4] : parts[2] || '').replace(/\.json$/i, '');
-      let kind=null;
-      if (id==='simklpicks.recommended-movies' && type==='movie')  kind='movie';
-      if (id==='simklpicks.recommended-series' && type==='series') kind='series';
-      if (id==='simklpicks.recommended-anime'  && type==='series') kind='anime';
-      if (!kind) return sendJson(res, { metas:[] }, 200);
+      let kind = null;
+      if (id==='simklpicks.recommended-movies'  && type==='movie')  kind='movie';
+      if (id==='simklpicks.recommended-series'  && type==='series') kind='series';
+      if (id==='simklpicks.recommended-anime'   && type==='series') kind='anime';
+      if (!kind) return sendJson(res, { metas: [] }, 200);
 
       const C = cache.get(kind);
-      if (C && !expired(C.exp)) return sendJson(res, { metas:C.data }, 200);
+      if (C && !expired(C.exp)) return sendJson(res, { metas: C.data }, 200);
 
-      const { metas, error } = await buildCatalog(kind);
-      if (error) return sendJson(res, { metas:[], error:{ source:'simkl', ...error } }, 200);
-
+      const metas = await makeCatalog(kind);
       cache.set(kind, { data: metas, exp: Date.now() + TTL_MIN*60*1000 });
       return sendJson(res, { metas }, 200);
     }
 
-    res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
   } catch (e) {
-    sendJson(res, { error:{ source:'server', message:String(e?.message||e) } }, 200);
+    sendJson(res, { error: { source:'server', message: String(e?.message || e) } }, 200);
   }
 }).listen(PORT, () => {
   console.log(`[SimklPicks] listening on :${PORT}`);
