@@ -1,11 +1,11 @@
-# ===== SimklPicks: hardened build (no SDK, direct /stremio/v1 routes) =====
+# ===== SimklPicks: normalized + dual routes (/stremio/v1 + /catalog) =====
 FROM node:20-alpine
 WORKDIR /app
 
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
   "dependencies": { "node-fetch": "^3.3.2" }
@@ -15,7 +15,7 @@ EOF
 RUN npm install --omit=dev
 RUN mkdir -p src
 
-# ---- Simkl client with safe error handling ----
+# ---- Simkl client (Bearer auth, safe error returns) ----
 RUN cat > src/simklClient.js <<'EOF'
 import fetch from 'node-fetch';
 
@@ -30,7 +30,6 @@ export class SimklClient {
       'Accept': 'application/json',
       'Content-Type': 'application/json',
       'simkl-api-key': this.apiKey,
-      // Simkl user endpoints expect Bearer
       ...(this.accessToken ? { 'Authorization': `Bearer ${this.accessToken}` } : {})
     };
   }
@@ -39,27 +38,28 @@ export class SimklClient {
       const r = await fetch(this.base + path, { headers: this.headers() });
       const text = await r.text();
       const body = text ? (() => { try { return JSON.parse(text); } catch { return { raw: text }; } })() : null;
-      if (!r.ok) {
-        return { ok: false, status: r.status, statusText: r.statusText, body };
-      }
-      return { ok: true, body: Array.isArray(body) ? body : (body || []) };
+      if (!r.ok) return { ok: false, status: r.status, statusText: r.statusText, body };
+      return { ok: true, body };
     } catch (e) {
       return { ok: false, status: 0, statusText: String(e?.message || e), body: null };
     }
   }
+  // Movies
   historyMovies()   { return this._get('/sync/history/movies'); }
   watchlistMovies() { return this._get('/sync/watchlist/movies'); }
   ratingsMovies()   { return this._get('/sync/ratings/movies'); }
+  // Series
   historyShows()    { return this._get('/sync/history/shows'); }
   watchlistShows()  { return this._get('/sync/watchlist/shows'); }
   ratingsShows()    { return this._get('/sync/ratings/shows'); }
+  // Anime (series)
   historyAnime()    { return this._get('/sync/history/anime'); }
   watchlistAnime()  { return this._get('/sync/watchlist/anime'); }
   ratingsAnime()    { return this._get('/sync/ratings/anime'); }
 }
 EOF
 
-# ---- Minimal server with robust debug + catalogs ----
+# ---- Server with normalizer + dual routes ----
 RUN cat > src/index.js <<'EOF'
 import http from 'http';
 import { SimklClient } from './simklClient.js';
@@ -68,7 +68,7 @@ const PORT = Number(process.env.PORT) || 7769;
 
 const manifest = {
   id: 'org.simkl.picks',
-  version: '1.5.1',
+  version: '1.5.2',
   name: 'SimklPicks',
   description: 'Recommendations based on your Simkl watchlists/history',
   resources: ['catalog'],
@@ -86,6 +86,7 @@ const simkl = new SimklClient({
   accessToken: process.env.SIMKL_ACCESS_TOKEN
 });
 
+// ---- helpers ----
 const pickId = (b={}) => {
   const ids = b.ids || {};
   if (ids.imdb) return String(ids.imdb).startsWith('tt') ? ids.imdb : `tt${ids.imdb}`;
@@ -104,7 +105,6 @@ const toMeta = (x) => {
     year: b.year
   };
 };
-
 function sendJson(res, obj, code=200) {
   const s = JSON.stringify(obj);
   res.writeHead(code, {
@@ -114,11 +114,20 @@ function sendJson(res, obj, code=200) {
   });
   res.end(s);
 }
-
+// ---- NEW: normalize Simkl response shapes ----
+function normalizeListBody(b) {
+  if (Array.isArray(b)) return b;
+  if (b && Array.isArray(b.movies)) return b.movies;
+  if (b && Array.isArray(b.shows))  return b.shows;
+  if (b && Array.isArray(b.anime))  return b.anime;
+  if (b && Array.isArray(b.items))  return b.items;
+  if (b && Array.isArray(b.data))   return b.data;
+  return [];
+}
 async function safeList(callPromise) {
   const r = await callPromise;
   if (!r.ok) return { metas: [], error: r };
-  const list = Array.isArray(r.body) ? r.body : [];
+  const list = normalizeListBody(r.body);
   return { metas: list.map(toMeta).slice(0,50), error: null };
 }
 
@@ -132,16 +141,14 @@ http.createServer(async (req, res) => {
     }
     if (url.pathname === '/manifest.json') return sendJson(res, manifest);
 
-    // Strong auth debug: NEVER throws; shows whether we're sending Bearer, and first failing endpoint
+    // Strong auth check (will never 500)
     if (url.pathname === '/debug-auth') {
-      const authHasBearer = (process.env.SIMKL_ACCESS_TOKEN || '').startsWith('Bearer ');
       const test = await simkl.watchlistMovies();
       return sendJson(res, {
         ok: !!process.env.SIMKL_API_KEY && !!process.env.SIMKL_ACCESS_TOKEN && test.ok,
         hasApiKey: !!process.env.SIMKL_API_KEY,
         hasAccessToken: !!process.env.SIMKL_ACCESS_TOKEN,
-        accessTokenLooksBearerPrefixed: authHasBearer,
-        testCall: test.ok ? { ok:true, count:Array.isArray(test.body)?test.body.length:0 } :
+        testCall: test.ok ? { ok:true, count: normalizeListBody(test.body).length } :
                             { ok:false, status:test.status, statusText:test.statusText, body:test.body }
       });
     }
@@ -155,16 +162,19 @@ http.createServer(async (req, res) => {
       const out = {};
       for (const fn of fns) {
         const r = await simkl[fn]();
-        out[fn] = r.ok ? (Array.isArray(r.body)?r.body.length:0) :
+        out[fn] = r.ok ? normalizeListBody(r.body).length :
                          { status:r.status, statusText:r.statusText, body:r.body };
       }
       return sendJson(res, out);
     }
 
-    // Serve Stremio paths directly: /stremio/v1/catalog/<type>/<id>.json
-    if (parts[0] === 'stremio' && parts[1] === 'v1' && parts[2] === 'catalog') {
-      const type = parts[3];
-      const id = (parts[4] || '').replace(/\.json$/i, '');
+    // ---- Catalog routes: support both new and old paths ----
+    // /stremio/v1/catalog/<type>/<id>.json  OR  /catalog/<type>/<id>.json
+    const isNew = parts[0] === 'stremio' && parts[1] === 'v1' && parts[2] === 'catalog';
+    const isOld = parts[0] === 'catalog';
+    if (isNew || isOld) {
+      const type = isNew ? parts[3] : parts[1];
+      const id   = (isNew ? parts[4] : parts[2] || '').replace(/\.json$/i, '');
 
       let result = { metas: [], error: null };
       if (id === 'simklpicks.recommended-movies' && type === 'movie') {
@@ -182,7 +192,6 @@ http.createServer(async (req, res) => {
       }
 
       if (result.error && result.error.status) {
-        // Surface Simkl error to Stremio so you see status instead of generic 500
         return sendJson(res, { metas: [], error: { source:'simkl', ...result.error } }, 200);
       }
       return sendJson(res, { metas: result.metas }, 200);
