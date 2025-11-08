@@ -1,11 +1,11 @@
 FROM node:20-alpine
 WORKDIR /app
 
-# minimal package.json
+# --- minimal package.json ---
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
   "dependencies": { "node-fetch": "^3.3.2" }
@@ -15,6 +15,7 @@ EOF
 RUN npm install --omit=dev
 RUN mkdir -p src
 ENV PORT=7769
+ENV CACHE_TTL_MINUTES=240
 EXPOSE 7769
 
 # =========================
@@ -52,6 +53,7 @@ export async function buckets(kind){ // 'movie' | 'series'
   ]);
   return {history, ratings};
 }
+
 export function profileFrom({history=[],ratings=[]}){
   const bag = new Map();
   const add = (g,w)=> bag.set(g,(bag.get(g)||0)+w);
@@ -64,6 +66,40 @@ export function profileFrom({history=[],ratings=[]}){
   }
   const genres = Array.from(bag.entries()).map(([name,weight])=>({name,weight}));
   return { genres };
+}
+
+/** lightweight discovery pool if AI returns nothing */
+export async function fallbackTitles(kind, limit=90){
+  const lists = [];
+  const add = a => { if (Array.isArray(a)) lists.push(...a); };
+  async function safe(path, q={}) {
+    try {
+      const r = await fetch(API + path + (Object.keys(q).length?`?${new URLSearchParams(q)}`:''), { headers: H() });
+      if (!r.ok) return [];
+      return await r.json();
+    } catch { return []; }
+  }
+  if (kind==='movie') {
+    add(await safe('/movies/popular', ext));
+    add(await safe('/movies/trending', ext));
+    add(await safe('/movies/top', ext));
+  } else {
+    add(await safe('/shows/popular', ext));
+    add(await safe('/shows/trending', ext));
+    add(await safe('/shows/top', ext));
+  }
+  const seen = new Set(); const out=[];
+  for (const x of lists){
+    const b = baseOf(x);
+    const title = b.title || b.name; if (!title) continue;
+    const year = b.year;
+    const k = `${title}|${year||''}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ title, year, kind: (kind==='movie'?'movie':'series') });
+    if (out.length>=limit) break;
+  }
+  return out;
 }
 EOF
 
@@ -78,8 +114,8 @@ export async function aiSuggest(profileMovies, profileSeries, max=80){
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) return [];
   const model = process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet';
-  const sys = `Output ONLY JSON array. Each item: {"title":string,"year":number|undefined,"kind":"movie"|"series"|"anime"}.
-Suggest new-to-user, slightly niche picks likely to be enjoyed, based on the two profiles. No commentary.`;
+  const sys = `Output ONLY a JSON array. Each item: {"title":string,"year":number|undefined,"kind":"movie"|"series"|"anime"}.
+Suggest new-to-user, slightly niche picks likely enjoyed based on the two profiles. Avoid mega-pop hits. No commentary.`;
   const user = { max, profileMovies, profileSeries };
 
   const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -105,7 +141,7 @@ Suggest new-to-user, slightly niche picks likely to be enjoyed, based on the two
 EOF
 
 # =========================
-#  src/tvdb.js  (resolve to TVDB IDs)
+#  src/tvdb.js  (robust TVDB resolver)
 # =========================
 RUN cat > src/tvdb.js <<'EOF'
 import fetch from 'node-fetch';
@@ -119,13 +155,14 @@ async function tvdbLogin() {
   const pin = process.env.TVDB_PIN || '';
   const body = pin ? { apikey, pin } : { apikey };
   const r = await fetch(`${API}/login`, {
-    method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify(body)
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify(body)
   });
   if (!r.ok) throw new Error(`TVDB login ${r.status}`);
-  const j = await r.json();
+  const j = await r.json().catch(()=>null);
   TVDB_TOKEN = j?.data?.token || null;
-  // token typically valid for a while; set soft TTL (1 day)
-  TVDB_EXP = Date.now() + 24*3600*1000;
+  TVDB_EXP = Date.now() + 24*3600*1000; // 1 day soft TTL
 }
 
 async function H() {
@@ -136,46 +173,82 @@ async function H() {
 async function jget(path) {
   const r = await fetch(`${API}${path}`, { headers: await H() });
   if (!r.ok) throw new Error(`TVDB ${r.status} ${r.statusText} ${path}`);
-  return r.json();
+  return r.json().catch(()=>({}));
 }
 
-// --- Search helpers ---
-// TV: /search?query=...&type=series
-// Movie: /search?query=...&type=movie
-export async function tvdbSearchSeries(title, year){
-  const q = new URLSearchParams({ query: title, type: 'series' });
-  const j = await jget(`/search?${q.toString()}`).catch(()=>null);
-  let arr = j?.data || [];
-  if (year) arr = arr.filter(x => Number(x?.year) === Number(year) || Number(x?.firstAired?.slice(0,4))===Number(year));
-  return arr;
-}
-export async function tvdbSearchMovie(title, year){
-  const q = new URLSearchParams({ query: title, type: 'movie' });
-  const j = await jget(`/search?${q.toString()}`).catch(()=>null);
-  let arr = j?.data || [];
-  if (year) arr = arr.filter(x => Number(x?.year) === Number(year) || Number(x?.firstAired?.slice(0,4))===Number(year));
-  return arr;
+function cleanTitle(s) {
+  if (!s) return '';
+  let t = String(s);
+  t = t.replace(/\(\d{4}\)/g, ' ');
+  t = t.split(' - ')[0];
+  t = t.split(': ')[0];
+  t = t.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+  return t;
 }
 
-function pickBest(arr){
+function yearInt(y){ const n = Number(y); return Number.isFinite(n) && n>1800 && n<3000 ? n : undefined; }
+function matchYearScore(entry, year){
+  if (!year) return 0.5;
+  const y = yearInt(year);
+  if (!y) return 0.0;
+  const c1 = yearInt(entry?.year);
+  const c2 = entry?.firstAired ? yearInt(String(entry.firstAired).slice(0,4)) : undefined;
+  if (c1 === y || c2 === y) return 1.0;
+  if (c1 === y-1 || c1 === y+1 || c2 === y-1 || c2 === y+1) return 0.6;
+  return 0.0;
+}
+
+function pickBest(arr, title, year){
   if (!Array.isArray(arr) || !arr.length) return null;
-  // prefer highest score if present, else popularity proxies
-  const ranked = arr.slice().sort((a,b)=>{
-    const sa = Number(a?.score||0), sb = Number(b?.score||0);
-    if (sb!==sa) return sb-sa;
-    const va = Number(a?.siteRatingCount||0), vb = Number(b?.siteRatingCount||0);
-    if (vb!==va) return vb-va;
-    return String(a?.name||'').localeCompare(String(b?.name||''));
+  const q = cleanTitle(title);
+  const scored = arr.map(x=>{
+    const name = String(x?.name || x?.title || '').trim();
+    const matchTitle = cleanTitle(name);
+    const titleSim = (q && matchTitle) ? (q.toLowerCase() === matchTitle.toLowerCase() ? 1 : 0) : 0;
+    const yScore = matchYearScore(x, year);
+    const pop = Number(x?.siteRatingCount || x?.score || 0);
+    return { x, score: titleSim*2 + yScore + (pop/1000) };
   });
-  return ranked[0];
+  scored.sort((a,b)=> b.score - a.score);
+  return scored[0].x;
+}
+
+async function search(title, year, type){ // type: 'movie' | 'series' | undefined
+  const q = new URLSearchParams({ query: title, ...(type ? { type } : {}) }).toString();
+  const j = await jget(`/search?${q}`).catch(()=>null);
+  let arr = j?.data || [];
+  if (year) {
+    const y = yearInt(year);
+    if (y) {
+      arr = arr.filter(x=>{
+        const y1 = yearInt(x?.year);
+        const y2 = x?.firstAired ? yearInt(String(x.firstAired).slice(0,4)) : undefined;
+        return (y1===y || y2===y || y1===y-1 || y1===y+1 || y2===y-1 || y2===y+1);
+      });
+    }
+  }
+  return arr;
 }
 
 export async function toTvdbId(kind, title, year){
-  const results = (kind==='movie') ? await tvdbSearchMovie(title, year)
-                                   : await tvdbSearchSeries(title, year);
-  const best = pickBest(results);
-  return best?.tvdb_id ? `tvdb:${best.tvdb_id}` :
-         best?.id      ? `tvdb:${best.id}` : null;
+  const t = (kind === 'movie') ? 'movie' : 'series';
+  const tries = [
+    [title, year, t],
+    [title, undefined, t],
+    [cleanTitle(title), year, t],
+    [title, year, undefined],
+    [cleanTitle(title), undefined, undefined]
+  ];
+  for (const [ti, yr, ty] of tries) {
+    if (!ti) continue;
+    const arr = await search(ti, yr, ty).catch(()=>[]);
+    const best = pickBest(arr, ti, yr);
+    if (best?.tvdb_id || best?.id) {
+      const id = best.tvdb_id ?? best.id;
+      return `tvdb:${id}`;
+    }
+  }
+  return null;
 }
 EOF
 
@@ -184,7 +257,7 @@ EOF
 # =========================
 RUN cat > src/index.js <<'EOF'
 import http from 'http';
-import { buckets, profileFrom } from './simkl.js';
+import { buckets, profileFrom, fallbackTitles } from './simkl.js';
 import { aiSuggest } from './ai.js';
 import { toTvdbId } from './tvdb.js';
 
@@ -193,11 +266,11 @@ const TTL = Number(process.env.CACHE_TTL_MINUTES || 240) * 60 * 1000;
 
 const MANIFEST = {
   id: 'org.simkl.picks',
-  version: '3.1.0',
+  version: '3.2.0',
   name: 'SimklPicks (AI + TVDB)',
-  description: 'AI suggestions from Simkl history/ratings; all metadata via TVDB (tvdb: IDs).',
+  description: 'Novel AI recommendations from Simkl history & ratings, resolved to tvdb: IDs.',
   resources: ['catalog'],
-  types: ['movie','series'],   // anime is served as type "series"
+  types: ['movie','series'],   // anime is served as "series"
   idPrefixes: ['tvdb'],
   catalogs: [
     { type: 'movie',  id: 'simklpicks.recommended-movies', name: 'Simkl Picks • Movies (AI, unseen)' },
@@ -207,44 +280,58 @@ const MANIFEST = {
 };
 
 function sendJSON(res, obj, code=200){
-  res.writeHead(code, {'Content-Type':'application/json; charset=utf-8','Access-Control-Allow-Origin':'*','Cache-Control':'no-store'});
+  res.writeHead(code, {
+    'Content-Type':'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin':'*',
+    'Cache-Control':'no-store'
+  });
   res.end(JSON.stringify(obj));
 }
-
-function ensureMetas(res, fn){
+function alwaysMetas(res, fn){
   (async ()=>{ const metas = await fn(); sendJSON(res, { metas }); })()
     .catch(()=> sendJSON(res, { metas: [] }));
 }
 
-const cache = new Map(); // kind -> {data, exp}
+const cache = new Map(); // key -> {data, exp}
 
 async function build(kind){
-  // 1) build profiles from Simkl
+  // 1) Get viewing profiles (movies & series) for AI
   const bMovie  = await buckets('movie').catch(()=>({history:[],ratings:[]}));
   const bSeries = await buckets('series').catch(()=>({history:[],ratings:[]}));
   const profMovies = profileFrom(bMovie);
   const profSeries = profileFrom(bSeries);
 
-  // 2) ask AI for fresh suggestions (or empty if no OPENROUTER_API_KEY)
-  const suggestions = await aiSuggest(profMovies, profSeries, 90); // [{title,year,kind}]
+  // 2) Ask AI for novel picks (optional)
+  let suggestions = await aiSuggest(profMovies, profSeries, 90); // [{title,year,kind}]
 
-  // 3) map suggestions to TVDB IDs
+  // 3) Fallback to Simkl discovery if AI returns nothing
+  if (!suggestions || suggestions.length === 0) {
+    suggestions = await fallbackTitles(kind, 90);
+  }
+
+  // 4) Keep only target kind (anime -> series)
+  const targetKind = kind; // 'movie' | 'series'
+  const wanted = suggestions.filter(s => {
+    const k = (s.kind === 'anime') ? 'series' : s.kind;
+    return k === targetKind;
+  });
+
+  // 5) Resolve to TVDB IDs
   const items = [];
-  for (const s of suggestions){
-    const targetKind = (s.kind === 'anime') ? 'series' : s.kind; // anime resolves as series in Stremio
-    if (targetKind !== kind) continue;
-    const id = await toTvdbId(targetKind, s.title, s.year).catch(()=>null);
-    if (id) items.push({ id, type: targetKind, name: s.title, year: s.year });
+  for (const s of wanted) {
+    const tvdb = await toTvdbId(targetKind, s.title, s.year).catch(()=>null);
+    if (tvdb) items.push({ id: tvdb, type: targetKind, name: s.title, year: s.year });
     if (items.length >= 50) break;
   }
   return items;
 }
 
 http.createServer((req,res)=>{
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const path = url.pathname.replace(/\.json$/i,'');
+  const rawPath = new URL(req.url, `http://${req.headers.host}`).pathname;
+  const path = rawPath.replace(/\.json$/i, '');
+
   if (path==='/' || path==='/health') return res.end('ok');
-  if (path==='/manifest.json') return sendJSON(res, MANIFEST);
+  if (rawPath==='/manifest.json' || path==='/manifest') return sendJSON(res, MANIFEST);
 
   if (path==='/env-check'){
     return sendJSON(res, {
@@ -257,6 +344,32 @@ http.createServer((req,res)=>{
     });
   }
 
+  // AI preview before TVDB resolution
+  if (path==='/ids-preview'){
+    (async ()=>{
+      const k = (new URL(req.url, `http://${req.headers.host}`)).searchParams.get('type') || 'movie';
+      const bMovie  = await buckets('movie').catch(()=>({history:[],ratings:[]}));
+      const bSeries = await buckets('series').catch(()=>({history:[],ratings:[]}));
+      const sugg = await aiSuggest(profileFrom(bMovie), profileFrom(bSeries), 30);
+      return sendJSON(res, { type: k.toLowerCase(), items: sugg });
+    })().catch(()=> sendJSON(res,{type:'unknown',items:[]}));
+    return;
+  }
+
+  // Single-title TVDB lookup debug
+  if (path==='/tvdb-lookup'){
+    (async ()=>{
+      const u = new URL(req.url, `http://${req.headers.host}`);
+      const title = u.searchParams.get('title') || '';
+      const year  = u.searchParams.get('year') || '';
+      const kind  = (u.searchParams.get('kind') || 'movie').toLowerCase();
+      const id = await toTvdbId(kind==='anime' ? 'series' : kind, title, year).catch(()=>null);
+      return sendJSON(res, { title, year, kind, tvdb: id });
+    })().catch(()=> sendJSON(res,{error:'lookup failed'}));
+    return;
+  }
+
+  // Stremio catalog routes (new + legacy)
   const routes = [
     ['/stremio/v1/catalog/movie/simklpicks.recommended-movies',  'movie'],
     ['/stremio/v1/catalog/series/simklpicks.recommended-series', 'series'],
@@ -265,12 +378,11 @@ http.createServer((req,res)=>{
     ['/catalog/series/simklpicks.recommended-series',            'series'],
     ['/catalog/series/simklpicks.recommended-anime',             'series']
   ];
-
   for (const [p, kind] of routes){
     if (path === p){
       const C = cache.get(p);
       if (C && Date.now() <= C.exp) return sendJSON(res, { metas: C.data });
-      return ensureMetas(res, async ()=>{
+      return alwaysMetas(res, async ()=>{
         const metas = await build(kind);
         cache.set(p, { data: metas, exp: Date.now() + TTL });
         return metas;
@@ -278,31 +390,11 @@ http.createServer((req,res)=>{
     }
   }
 
-  // debug: preview raw titles resolved to TVDB ids
-  if (path==='/ids-preview'){
-    return (async ()=>{
-      const k = (url.searchParams.get('type')||'movie').toLowerCase();
-      const bMovie  = await buckets('movie').catch(()=>({history:[],ratings:[]}));
-      const bSeries = await buckets('series').catch(()=>({history:[],ratings:[]}));
-      const profMovies = profileFrom(bMovie);
-      const profSeries = profileFrom(bSeries);
-      const sugg = await aiSuggest(profMovies, profSeries, 30);
-      const out = [];
-      for (const s of sugg){
-        const targetKind = (s.kind==='anime') ? 'series' : s.kind;
-        if (targetKind !== k) continue;
-        const id = await toTvdbId(targetKind, s.title, s.year).catch(()=>null);
-        out.push({ title:s.title, year:s.year, kind:s.kind, tvdb:id });
-      }
-      return sendJSON(res, { type:k, items: out });
-    })().catch(()=> sendJSON(res,{type:'unknown',items:[]}));
-  }
-
-  // fallback
+  // any other path
   return sendJSON(res, { error: 'not found' }, 404);
-}).listen(PORT, ()=> {
-  console.log(`[SimklPicks TVDB] listening on :${PORT}`);
-  console.log(`[SimklPicks TVDB] manifest: http://localhost:${PORT}/manifest.json`);
+}).listen(PORT, ()=>{
+  console.log(`[SimklPicks] listening on :${PORT}`);
+  console.log(`[SimklPicks] manifest: http://localhost:${PORT}/manifest.json`);
 });
 EOF
 
