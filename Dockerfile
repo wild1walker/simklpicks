@@ -1,16 +1,13 @@
 FROM node:20-alpine
 WORKDIR /app
 
-# Minimal package descriptor
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "4.1.0",
+  "version": "4.1.1",
   "type": "module",
   "scripts": { "start": "node src/index.js" },
-  "dependencies": {
-    "node-fetch": "^3.3.2"
-  }
+  "dependencies": { "node-fetch": "^3.3.2" }
 }
 EOF
 
@@ -19,9 +16,7 @@ RUN mkdir -p src
 ENV PORT=7769
 EXPOSE 7769
 
-# -----------------------
-# src/simkl.js
-# -----------------------
+# -------- src/simkl.js --------
 RUN cat > src/simkl.js <<'EOF'
 import fetch from 'node-fetch';
 const API = 'https://api.simkl.com';
@@ -34,7 +29,6 @@ function H() {
     'simkl-api-key': process.env.SIMKL_API_KEY || ''
   };
   const tok = process.env.SIMKL_ACCESS_TOKEN || '';
-  // Some SIMKL tokens require "Bearer " prefix; controlled by SIMKL_BEARER=1
   if (tok) h['Authorization'] = (process.env.SIMKL_BEARER === '1') ? `Bearer ${tok}` : tok;
   return h;
 }
@@ -47,7 +41,7 @@ async function jget(path, q = {}) {
 }
 export function baseOf(x){ return x?.movie || x?.show || x || {}; }
 
-export async function buckets(kind){ // 'movie' | 'series'
+export async function buckets(kind){
   const type = kind === 'movie' ? 'movies' : 'shows';
   const [history, ratings] = await Promise.all([
     jget(`/sync/history/${type}`, ext).catch(()=>[]),
@@ -57,7 +51,6 @@ export async function buckets(kind){ // 'movie' | 'series'
 }
 
 export function profileFrom({history=[],ratings=[]}){
-  // Lightweight taste profile (genre weights)
   const bag = new Map();
   const add = (g,w)=> bag.set(g,(bag.get(g)||0)+w);
   const mix = [...history, ...ratings];
@@ -72,25 +65,35 @@ export function profileFrom({history=[],ratings=[]}){
 }
 EOF
 
-# -----------------------
-# src/ai.js  (OpenRouter with headers + /ai-debug support)
-# -----------------------
+# -------- src/ai.js (model normalization + /ai-debug support) --------
 RUN cat > src/ai.js <<'EOF'
 import fetch from 'node-fetch';
+
+// Normalize to a valid OpenRouter model id.
+// Examples: "anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini"
+function normalizeModel(m){
+  let model = (m || '').trim();
+  if (!model) return 'anthropic/claude-3.5-sonnet';
+  // if someone put "openrouter/anthropic/claude-3.5-sonnet", strip the "openrouter/" prefix
+  if (model.toLowerCase().startsWith('openrouter/')) model = model.slice('openrouter/'.length);
+  // if someone put just "openrouter", fall back
+  if (model.toLowerCase() === 'openrouter') model = 'anthropic/claude-3.5-sonnet';
+  return model;
+}
 
 // returns [{title, year?, kind}] where kind in {"movie","series","anime"}
 export async function aiSuggest(profileMovies, profileSeries, max=80){
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) return [];
 
-  const model = process.env.LLM_MODEL || 'openrouter/anthropic/claude-3.5-sonnet';
+  const model = normalizeModel(process.env.LLM_MODEL);
   const site = process.env.OPENROUTER_SITE_URL || process.env.SELF_BASE_URL || '';
   const app  = process.env.OPENROUTER_APP_NAME || 'SimklPicks';
 
   const sys = `You are a recommender. Output ONLY a JSON array.
 Each item: {"title":string,"year":number|undefined,"kind":"movie"|"series"|"anime"}.
 Suggest NEW-to-user titles (assume supplied profile are already seen/liked),
-lean slightly niche/under-discovered, cover movies/series/anime as appropriate. No commentary.`;
+lean slightly niche/under-discovered, cover movies/series/anime. No commentary.`;
 
   const user = { max, profileMovies, profileSeries };
 
@@ -108,8 +111,8 @@ lean slightly niche/under-discovered, cover movies/series/anime as appropriate. 
     'Authorization': `Bearer ${key}`,
     'Content-Type': 'application/json'
   };
-  if (site) headers['HTTP-Referer'] = site; // OpenRouter best practice
-  headers['X-Title'] = app;                 // OpenRouter best practice
+  if (site) headers['HTTP-Referer'] = site;
+  headers['X-Title'] = app;
 
   const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -117,9 +120,9 @@ lean slightly niche/under-discovered, cover movies/series/anime as appropriate. 
     body: JSON.stringify(body)
   });
 
-  const text = await r.text(); // capture raw for /ai-debug
+  const text = await r.text();
   let j; try { j = JSON.parse(text); } catch { j = null; }
-  globalThis.__AI_LAST_RAW__ = { status: r.status, ok: r.ok, text, parsed: j };
+  globalThis.__AI_LAST_RAW__ = { status: r.status, ok: r.ok, text, parsed: j, model };
 
   if (!r.ok) return [];
 
@@ -141,9 +144,7 @@ lean slightly niche/under-discovered, cover movies/series/anime as appropriate. 
 export function getLastAiRaw(){ return globalThis.__AI_LAST_RAW__ || null; }
 EOF
 
-# -----------------------
-# src/tvdb.js  (robust TVDB resolver)
-# -----------------------
+# -------- src/tvdb.js --------
 RUN cat > src/tvdb.js <<'EOF'
 import fetch from 'node-fetch';
 const API = 'https://api4.thetvdb.com/v4';
@@ -163,7 +164,7 @@ async function tvdbLogin() {
   if (!r.ok) throw new Error(`TVDB login ${r.status}`);
   const j = await r.json().catch(()=>null);
   TVDB_TOKEN = j?.data?.token || null;
-  TVDB_EXP = Date.now() + 24*3600*1000; // ~1 day
+  TVDB_EXP = Date.now() + 24*3600*1000;
 }
 async function H() {
   if (!TVDB_TOKEN || Date.now() > TVDB_EXP) await tvdbLogin();
@@ -206,7 +207,7 @@ function pickBest(arr, title, year){
   }).sort((a,b)=> b.score-a.score);
   return scored[0].x;
 }
-async function search(title, year, type){ // type: 'movie'|'series'|undefined
+async function search(title, year, type){
   const q = new URLSearchParams({ query: title, ...(type?{type}:{}) }).toString();
   const j = await jget(`/search?${q}`).catch(()=>null);
   let arr = j?.data || [];
@@ -242,9 +243,7 @@ export async function toTvdbId(kind, title, year){
 }
 EOF
 
-# -----------------------
-# src/index.js (server)
-# -----------------------
+# -------- src/index.js --------
 RUN cat > src/index.js <<'EOF'
 import http from 'http';
 import { buckets, profileFrom } from './simkl.js';
@@ -256,11 +255,11 @@ const TTL  = Number(process.env.CACHE_TTL_MINUTES || 240) * 60 * 1000;
 
 const MANIFEST = {
   id: 'org.simkl.picks',
-  version: '4.1.0',
+  version: '4.1.1',
   name: 'SimklPicks (AI-only, TVDB)',
   description: 'AI-only novel recommendations from Simkl history & ratings; metadata via tvdb: IDs.',
   resources: ['catalog'],
-  types: ['movie','series'],   // anime served as "series"
+  types: ['movie','series'],
   idPrefixes: ['tvdb'],
   catalogs: [
     { type: 'movie',  id: 'simklpicks.recommended-movies', name: 'Simkl Picks • Movies (AI, unseen)' },
@@ -282,27 +281,23 @@ function alwaysMetas(res, fn){
     .catch(()=> sendJSON(res, { metas: [] }));
 }
 
-const cache = new Map(); // path -> {data, exp}
+const cache = new Map();
 
 async function build(kind){
-  // 1) Build profiles for AI
   const bMovie  = await buckets('movie').catch(()=>({history:[],ratings:[]}));
   const bSeries = await buckets('series').catch(()=>({history:[],ratings:[]}));
   const profMovies = profileFrom(bMovie);
   const profSeries = profileFrom(bSeries);
 
-  // 2) Ask AI for novel picks (AI-only; no fallback)
-  const suggestions = await aiSuggest(profMovies, profSeries, 90); // [{title, year, kind}]
-  if (!Array.isArray(suggestions) || suggestions.length === 0) return []; // AI empty => empty catalog
+  const suggestions = await aiSuggest(profMovies, profSeries, 90);
+  if (!Array.isArray(suggestions) || suggestions.length === 0) return [];
 
-  // 3) Keep only target kind (anime -> series)
   const wanted = suggestions.filter(s => {
     const k = (s.kind === 'anime') ? 'series' : s.kind;
     return k === kind;
   });
   if (wanted.length === 0) return [];
 
-  // 4) Resolve to TVDB IDs
   const items = [];
   for (const s of wanted) {
     const tvdb = await toTvdbId(kind, s.title, s.year).catch(()=>null);
@@ -315,7 +310,7 @@ async function build(kind){
 const server = http.createServer((req,res)=>{
   const u = new URL(req.url, `http://${req.headers.host}`);
   const rawPath = u.pathname;
-  const path = rawPath.replace(/\.json$/i,''); // strip .json
+  const path = rawPath.replace(/\.json$/i,''); 
 
   if (path==='/' || path==='/health') return res.end('ok');
   if (rawPath==='/manifest.json' || path==='/manifest') return sendJSON(res, MANIFEST);
@@ -331,7 +326,6 @@ const server = http.createServer((req,res)=>{
     });
   }
 
-  // Simkl counts: ensure we actually have data
   if (path==='/simkl-stats'){
     (async ()=>{
       const bm = await buckets('movie').catch(()=>({history:[],ratings:[]}));
@@ -344,7 +338,6 @@ const server = http.createServer((req,res)=>{
     return;
   }
 
-  // Raw AI output (what OpenRouter returned after parsing)
   if (path==='/ai-raw'){
     (async ()=>{
       const bMovie  = await buckets('movie').catch(()=>({history:[],ratings:[]}));
@@ -355,16 +348,14 @@ const server = http.createServer((req,res)=>{
     return;
   }
 
-  // Last raw OpenRouter response (status + body)
   if (path==='/ai-debug'){
     const payload = getLastAiRaw();
     return sendJSON(res, payload ? payload : { ok:false, note:'call /ai-raw once first' });
   }
 
-  // Preview after filtering by type, before TVDB resolution
   if (path==='/ids-preview'){
     (async ()=>{
-      const type = (u.searchParams.get('type')||'movie').toLowerCase(); // movie|series|anime
+      const type = (u.searchParams.get('type')||'movie').toLowerCase();
       const bMovie  = await buckets('movie').catch(()=>({history:[],ratings:[]}));
       const bSeries = await buckets('series').catch(()=>({history:[],ratings:[]}));
       const raw = await aiSuggest(profileFrom(bMovie), profileFrom(bSeries), 90).catch(()=>[]);
@@ -378,12 +369,11 @@ const server = http.createServer((req,res)=>{
     return;
   }
 
-  // TVDB single-title debug
   if (path==='/tvdb-lookup'){
     (async ()=>{
       const title = u.searchParams.get('title') || '';
       const year  = u.searchParams.get('year') || '';
-      const kind  = (u.searchParams.get('kind') || 'movie').toLowerCase(); // movie|series|anime
+      const kind  = (u.searchParams.get('kind') || 'movie').toLowerCase();
       const k = (kind==='anime') ? 'series' : kind;
       const id = await toTvdbId(k, title, year).catch(()=>null);
       return sendJSON(res, { title, year, kind, tvdb: id });
@@ -391,7 +381,6 @@ const server = http.createServer((req,res)=>{
     return;
   }
 
-  // Stremio catalogs
   const routes = [
     ['/stremio/v1/catalog/movie/simklpicks.recommended-movies',  'movie'],
     ['/stremio/v1/catalog/series/simklpicks.recommended-series', 'series'],
