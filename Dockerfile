@@ -1,140 +1,168 @@
-# ---- Base image ----
+# ========= SimklPicks (SDK + CommonJS) =========
 FROM node:20-alpine
-
-# ---- App directory ----
 WORKDIR /app
 
-# ---- Dependencies ----
+# ---- Dependencies (CommonJS) ----
 RUN cat > package.json <<'EOF'
 {
   "name": "simklpicks",
-  "version": "1.3.0",
-  "type": "module",
+  "version": "1.4.0",
+  "description": "Stremio addon: recommendations from your Simkl data",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js"
+  },
   "dependencies": {
     "axios": "^1.7.2",
     "stremio-addon-sdk": "^1.6.0"
-  },
-  "scripts": {
-    "start": "node src/index.js"
   }
 }
 EOF
 
 RUN npm install --omit=dev
-
-# ---- Source ----
 RUN mkdir -p src
 
-# simklClient.js with Bearer fix
-RUN cat > src/simklClient.js <<'EOF'
-import axios from "axios";
+# ---- Simkl client (Bearer auth) ----
+RUN cat > src/simklClient.cjs <<'EOF'
+const axios = require('axios');
 
-export default class SimklClient {
-  constructor(apiKey, accessToken) {
+class SimklClient {
+  constructor({ apiKey, accessToken }) {
     this.apiKey = apiKey;
     this.accessToken = accessToken;
-    this.base = "https://api.simkl.com";
+    this.base = 'https://api.simkl.com';
   }
-
   headers() {
     return {
-      "Accept": "application/json",
-      "Content-Type": "application/json",
-      "simkl-api-key": this.apiKey,
-      ...(this.accessToken ? { "Authorization": `Bearer ${this.accessToken}` } : {})
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'simkl-api-key': this.apiKey,
+      ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {})
     };
   }
-
-  async fetch(path) {
-    try {
-      const { data } = await axios.get(`${this.base}${path}`, { headers: this.headers() });
-      return data;
-    } catch (err) {
-      if (err.response)
-        return `ERR ${err.response.status} ${err.response.statusText}`;
-      return `ERR ${err.message}`;
-    }
+  async _get(path) {
+    const url = `${this.base}${path}`;
+    const res = await axios.get(url, { headers: this.headers() });
+    return res.data;
   }
 
-  async userSummary() {
-    return {
-      historyMovies: await this.fetch("/sync/history/movies"),
-      watchlistMovies: await this.fetch("/sync/watched/movies"),
-      ratingsMovies: await this.fetch("/sync/ratings/movies"),
-      historyShows: await this.fetch("/sync/history/shows"),
-      watchlistShows: await this.fetch("/sync/watched/shows"),
-      ratingsShows: await this.fetch("/sync/ratings/shows"),
-      historyAnime: await this.fetch("/sync/history/anime"),
-      watchlistAnime: await this.fetch("/sync/watched/anime"),
-      ratingsAnime: await this.fetch("/sync/ratings/anime")
-    };
-  }
+  // Movies
+  historyMovies()   { return this._get('/sync/history/movies'); }
+  watchlistMovies() { return this._get('/sync/watchlist/movies'); }
+  ratingsMovies()   { return this._get('/sync/ratings/movies'); }
+
+  // Series
+  historyShows()    { return this._get('/sync/history/shows'); }
+  watchlistShows()  { return this._get('/sync/watchlist/shows'); }
+  ratingsShows()    { return this._get('/sync/ratings/shows'); }
+
+  // Anime (as series)
+  historyAnime()    { return this._get('/sync/history/anime'); }
+  watchlistAnime()  { return this._get('/sync/watchlist/anime'); }
+  ratingsAnime()    { return this._get('/sync/ratings/anime'); }
 }
+
+module.exports = SimklClient;
 EOF
 
-# ---- index.js ----
+# ---- Index: SDK manifest + handlers + serveHTTP ----
 RUN cat > src/index.js <<'EOF'
-import { addonBuilder } from "stremio-addon-sdk";
-import SimklClient from "./simklClient.js";
-import http from "http";
+const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
+const SimklClient = require('./simklClient.cjs');
 
 const PORT = Number(process.env.PORT) || 7769;
-const simkl = new SimklClient(
-  process.env.SIMKL_API_KEY,
-  process.env.SIMKL_ACCESS_TOKEN
-);
 
 const manifest = {
-  id: "org.simkl.picks",
-  version: "1.3.0",
-  name: "SimklPicks",
-  description: "AI-style personalized picks from your Simkl data",
-  resources: ["catalog"],
-  types: ["movie", "series"],
+  id: 'org.simkl.picks',
+  version: '1.4.0',
+  name: 'SimklPicks',
+  description: 'Recommendations based on your Simkl watchlists/history',
+  resources: ['catalog'],
+  types: ['movie', 'series'],         // anime served under series
+  idPrefixes: ['tt', 'tmdb', 'tvdb'],
   catalogs: [
-    { type: "movie", id: "simklpicks.recommended-movies", name: "Simkl Picks: Movies" },
-    { type: "series", id: "simklpicks.recommended-series", name: "Simkl Picks: Series" },
-    { type: "series", id: "simklpicks.recommended-anime", name: "Simkl Picks: Anime" }
+    { type: 'series', id: 'simklpicks.recommended-series', name: 'Simkl Picks • Recommended Series' },
+    { type: 'movie',  id: 'simklpicks.recommended-movies', name: 'Simkl Picks • Recommended Movies' },
+    { type: 'series', id: 'simklpicks.recommended-anime',  name: 'Simkl Picks • Recommended Anime' }
   ]
 };
 
+const client = new SimklClient({
+  apiKey: process.env.SIMKL_API_KEY,
+  accessToken: process.env.SIMKL_ACCESS_TOKEN
+});
+
+function pickIds(base = {}) {
+  const ids = base.ids || {};
+  if (ids.imdb) return ids.imdb.toString().startsWith('tt') ? ids.imdb : `tt${ids.imdb}`;
+  if (ids.tmdb) return `tmdb:${ids.tmdb}`;
+  if (ids.tvdb) return `tvdb:${ids.tvdb}`;
+  if (base.slug) return base.slug;
+  return String(Math.random()).slice(2);
+}
+
+function toMeta(simklItem) {
+  // Simkl item may be under .movie / .show / .anime or the root
+  const b = simklItem.movie || simklItem.show || simklItem.anime || simklItem || {};
+  return {
+    id: pickIds(b),
+    type: (b.type === 'movie' ? 'movie' : 'series'),
+    name: b.title || b.name || b.show_title || b.movie_title || 'Untitled',
+    poster: b.poster || b.image || undefined,
+    posterShape: 'poster',
+    year: b.year
+  };
+}
+
+// Simple pool: prefer watchlist; fallback to ratings; last resort history (unseen filter can be added later)
+async function getPoolFor(id, type) {
+  try {
+    if (id === 'simklpicks.recommended-movies' && type === 'movie') {
+      const wl = await client.watchlistMovies();
+      if (Array.isArray(wl) && wl.length) return wl.map(toMeta);
+      const rt = await client.ratingsMovies();
+      if (Array.isArray(rt) && rt.length) return rt.map(toMeta);
+      const hi = await client.historyMovies();
+      return Array.isArray(hi) ? hi.map(toMeta) : [];
+    }
+    if (id === 'simklpicks.recommended-series' && type === 'series') {
+      const wl = await client.watchlistShows();
+      if (Array.isArray(wl) && wl.length) return wl.map(toMeta);
+      const rt = await client.ratingsShows();
+      if (Array.isArray(rt) && rt.length) return rt.map(toMeta);
+      const hi = await client.historyShows();
+      return Array.isArray(hi) ? hi.map(toMeta) : [];
+    }
+    if (id === 'simklpicks.recommended-anime' && type === 'series') {
+      const wl = await client.watchlistAnime();
+      if (Array.isArray(wl) && wl.length) return wl.map(toMeta);
+      const rt = await client.ratingsAnime();
+      if (Array.isArray(rt) && rt.length) return rt.map(toMeta);
+      const hi = await client.historyAnime();
+      return Array.isArray(hi) ? hi.map(toMeta) : [];
+    }
+  } catch (e) {
+    console.error('Simkl fetch failed:', e.message || e);
+  }
+  return [];
+}
+
 const builder = new addonBuilder(manifest);
 
-builder.defineCatalogHandler(async ({ id }) => {
-  const data = await simkl.userSummary();
-  const list = Object.values(data).flat();
-  const metas = Array.isArray(list)
-    ? list.slice(0, 50).map(item => ({
-        id: item.ids?.simkl?.toString() || "unknown",
-        type: "movie",
-        name: item.title || "Untitled",
-        poster: item.poster || "",
-        description: item.overview || ""
-      }))
-    : [];
+builder.defineCatalogHandler(async ({ id, type /*, extra */ }) => {
+  const pool = await getPoolFor(id, type);
+  const metas = (pool || []).filter(m => m && m.id && m.name).slice(0, 50);
   return { metas };
 });
 
-http.createServer((req, res) => {
-  if (req.url === "/manifest.json") {
-    res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify(manifest));
-  } else if (req.url.startsWith("/debug-auth")) {
-    res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({
-      ok: !!simkl.apiKey,
-      hasApiKey: !!simkl.apiKey,
-      hasAccessToken: !!simkl.accessToken
-    }));
-  } else {
-    res.statusCode = 404;
-    res.end("Not Found");
-  }
-}).listen(PORT, () => {
-  console.log(`[SimklPicks] listening on :${PORT}`);
-  console.log(`[SimklPicks] manifest: http://localhost:${PORT}/manifest.json`);
-});
+// Expose /manifest.json and /stremio/v1/* routes (catalogs)
+serveHTTP(builder.getInterface(), { port: PORT });
+console.log(`[SimklPicks] listening on :${PORT}`);
+console.log(`[SimklPicks] manifest: http://localhost:${PORT}/manifest.json`);
 EOF
 
+# ---- Runtime ----
+ENV PORT=7769
 EXPOSE 7769
-CMD ["npm", "start"]
+CMD ["npm","start"]
