@@ -383,7 +383,8 @@ app.get("/api/simkl/callback", async (req, res) => {
 
     saveConfig(config);
 
-    res.send(\`
+    // FIXED: no stray backslash before backtick
+    res.send(`
       <html>
         <body style="font-family: system-ui, sans-serif;">
           <h1>Simkl Connected ✅</h1>
@@ -391,7 +392,7 @@ app.get("/api/simkl/callback", async (req, res) => {
           <a href="/">Back to config</a>
         </body>
       </html>
-    \`);
+    `);
   } catch (e) {
     console.error("Simkl callback error:", e.response?.data || e.message);
     res.status(500).send("Error connecting to Simkl. Check server logs.");
@@ -419,8 +420,8 @@ async function fetchSimklLists() {
   for (const type of types) {
     for (const status of statuses) {
       const url =
-        \`https://api.simkl.com/sync/all-items/\${type}/\${encodeURIComponent(status)}\` +
-        \`?extended=full&episode_watched_at=yes&memos=yes\`;
+        `https://api.simkl.com/sync/all-items/${type}/${encodeURIComponent(status)}` +
+        `?extended=full&episode_watched_at=yes&memos=yes`;
       requests.push(
         axios.get(url, { headers }).then(r => ({
           type,
@@ -538,8 +539,8 @@ async function getAiRecommendations(simklData) {
   const systemPrompt = config.openrouter.systemPrompt || defaultSystemPrompt;
 
   const userContent =
-    "You are generating recommendations for a Stremio add-on.\\n\\n" +
-    "Here is the user's Simkl data grouped by type and status as JSON:\\n\\n" +
+    "You are generating recommendations for a Stremio add-on.\n\n" +
+    "Here is the user's Simkl data grouped by type and status as JSON:\n\n" +
     JSON.stringify({ simkl: simklData }, null, 2);
 
   const resp = await axios.post(
@@ -554,7 +555,7 @@ async function getAiRecommendations(simklData) {
     },
     {
       headers: {
-        "Authorization": \`Bearer \${config.openrouter.apiKey}\`,
+        "Authorization": `Bearer ${config.openrouter.apiKey}`,
         "Content-Type": "application/json"
       },
       timeout: 60000
@@ -684,13 +685,13 @@ app.get("/manifest.json", (req, res) => {
 });
 
 app.get("/catalog/:type/:id.json", (req, res) => {
-  addonInterface.get(\`/catalog/\${req.params.type}/\${req.params.id}.json\`, req, res);
+  addonInterface.get(`/catalog/${req.params.type}/${req.params.id}.json`, req, res);
 });
 
 // -------- START SERVER --------
 
 app.listen(PORT, () => {
-  console.log(\`Server listening on port \${PORT}\`);
+  console.log(`Server listening on port ${PORT}`);
 });
 EOF
 
