@@ -29,7 +29,7 @@ const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const { addonBuilder, getInterface } = require("stremio-addon-sdk");
+const { addonBuilder, getRouter } = require("stremio-addon-sdk");
 const { v4: uuidv4 } = require("uuid");
 
 const PORT = process.env.PORT || 7000;
@@ -383,7 +383,6 @@ app.get("/api/simkl/callback", async (req, res) => {
 
     saveConfig(config);
 
-    // FIXED: no stray backslash before backtick
     res.send(`
       <html>
         <body style="font-family: system-ui, sans-serif;">
@@ -496,7 +495,7 @@ Output format (VERY IMPORTANT):
     {
       "id": "string",
       "title": "string",
-      "year": 2020,
+      "year": 2020",
       "poster": "https://url-or-null",
       "background": "https://url-or-null",
       "overview": "string description"
@@ -677,15 +676,16 @@ builder.defineCatalogHandler(async args => {
   }
 });
 
-const addonInterface = getInterface(builder);
+// Build addon interface & router, mount after all UI/API routes
+const addonInterface = builder.getInterface();
+const router = getRouter(addonInterface);
 
-app.get("/manifest.json", (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  res.send(addonInterface.manifest);
-});
-
-app.get("/catalog/:type/:id.json", (req, res) => {
-  addonInterface.get(`/catalog/${req.params.type}/${req.params.id}.json`, req, res);
+// Stremio routes (manifest, catalog, etc.) handled by router
+app.use((req, res) => {
+  router(req, res, () => {
+    res.statusCode = 404;
+    res.end();
+  });
 });
 
 // -------- START SERVER --------
